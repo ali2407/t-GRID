@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+# tgrid — tile native macOS Terminal.app windows into a grid.
+# Each window is a real, separate Terminal window = a real, separate shell/session.
+# No multiplexer, no split panes, no tmux.
+#
+#   tgrid            open 4 Terminal windows running `claude` in a 2x2 grid
+#   tgrid 6          6 windows, 3x2
+#   tgrid 2 -c zsh   2 plain shells
+#   tgrid --reflow   re-tile the Terminal windows that are ALREADY open
+#   tgrid --undo     put them back where they were before the last tile
+#   tgrid --help
+set -euo pipefail
+
+VERSION="1.1"
+N=4
+CMD="claude"
+DIR="$PWD"
+ROWS=0
+COLS=0
+GAP=6
+PAD=0
+DISPLAY_IDX=0
+REFLOW=0
+UNDO=0
+HERE=0
+DIRS=""
+STATE="${XDG_CACHE_HOME:-$HOME/.cache}/tgrid/last-layout.json"
+
+usage() {
+  sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+  cat <<'EOF'
+
+Options
+  -c, --cmd CMD      command to run in each window (default: claude; "" = plain shell)
+  -d, --dir DIR      working directory for every window (default: cwd)
+      --dirs a,b,c   per-window working directories (overrides -d, sets N)
+  -r, --rows N       force row count
+  -k, --cols N       force column count
+  -g, --gap PX       gap between windows (default: 6)
+  -p, --pad PX       outer margin around the grid (default: 0)
+  -D, --display N    display index, 0 = main; "next" = the other monitor
+      --reflow       do not open anything; just tile existing Terminal windows
+      --here         with --reflow: only tile windows already on the target display
+      --undo         restore the window positions from before the last tile
+      --version      print version
+  -h, --help         this
+EOF
+}
+
+die() { echo "tgrid: $*" >&2; exit 1; }
+
+# Every option that takes a value goes through need(), so a missing value is a
+# clear message instead of bash's "unbound variable". It gets the live argument
+# count, because `-c ""` is legitimate (plain shell) while `-c` alone is not.
+need() {
+  [[ "$2" -ge 2 ]] || die "$1 needs a value"
+  [[ ! "$3" =~ ^-{1,2}[a-zA-Z] ]] || die "$1 needs a value (got the flag $3)"
+}
+num()  { [[ "$2" =~ ^[0-9]+$ ]] || die "$1 expects a number, got '$2'"; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -c|--cmd)     need "$1" "$#" "${2-}"; CMD="$2"; shift 2 ;;
+    -d|--dir)     need "$1" "$#" "${2-}"; DIR="$2"; shift 2 ;;
+    --dirs)       need "$1" "$#" "${2-}"; DIRS="$2"; shift 2 ;;
+    -r|--rows)    need "$1" "$#" "${2-}"; num "$1" "$2"; ROWS="$2"; shift 2 ;;
+    -k|--cols)    need "$1" "$#" "${2-}"; num "$1" "$2"; COLS="$2"; shift 2 ;;
+    -g|--gap)     need "$1" "$#" "${2-}"; num "$1" "$2"; GAP="$2"; shift 2 ;;
+    -p|--pad)     need "$1" "$#" "${2-}"; num "$1" "$2"; PAD="$2"; shift 2 ;;
+    -D|--display) need "$1" "$#" "${2-}"
+                  [[ "$2" == "next" || "$2" == "other" ]] || num "$1" "$2"
+                  DISPLAY_IDX="$2"; shift 2 ;;
+    --reflow)     REFLOW=1; shift ;;
+    --here)       HERE=1; shift ;;
+    --undo)       UNDO=1; shift ;;
+    --version)    echo "tgrid $VERSION"; exit 0 ;;
+    -h|--help)    usage; exit 0 ;;
+    [0-9]*)       num "count" "$1"; N="$1"; shift ;;
+    *)            echo "tgrid: unknown option $1" >&2; usage >&2; exit 1 ;;
+  esac
+done
+
+[[ -d "$DIR" ]] || die "no such directory: $DIR"
+DIR="$(cd "$DIR" && pwd)"
+
+# resolve ~ and relative paths in --dirs, and fail loudly on a bad one
+if [[ -n "$DIRS" ]]; then
+  resolved=""
+  IFS=',' read -ra _parts <<< "$DIRS"
+  for p in "${_parts[@]}"; do
+    p="${p#"${p%%[![:space:]]*}"}"          # ltrim
+    p="${p%"${p##*[![:space:]]}"}"          # rtrim
+    [[ -z "$p" ]] && continue
+    p="${p/#\~/$HOME}"
+    [[ -d "$p" ]] || die "--dirs: no such directory: $p"
+    resolved+="$(cd "$p" && pwd),"
+  done
+  DIRS="${resolved%,}"
+fi
+
+mkdir -p "$(dirname "$STATE")"
+
+case "$DISPLAY_IDX" in next|other) DISPLAY_IDX=-1 ;; esac
+
+# Args are passed positionally — no JSON, no python, nothing to escape wrong.
+osascript -l JavaScript - \
+  "$N" "$CMD" "$DIR" "$DIRS" "$ROWS" "$COLS" "$GAP" "$PAD" \
+  "$DISPLAY_IDX" "$REFLOW" "$UNDO" "$HERE" "$STATE" <<'JXA'
+function run(argv) {
+  ObjC.import('AppKit');
+  ObjC.import('Foundation');
+  function delay(sec) { $.NSThread.sleepForTimeInterval(sec); }
+
+  var a = {
+    n: parseInt(argv[0], 10),
+    cmd: argv[1],
+    dir: argv[2],
+    dirs: argv[3] ? argv[3].split(',').filter(function (s) { return s.length; }) : [],
+    rows: parseInt(argv[4], 10),
+    cols: parseInt(argv[5], 10),
+    gap: parseInt(argv[6], 10),
+    pad: parseInt(argv[7], 10),
+    display: parseInt(argv[8], 10),
+    reflow: argv[9] === '1',
+    undo: argv[10] === '1',
+    here: argv[11] === '1',
+    state: argv[12]
+  };
+
+  var Term = Application('Terminal');
+  Term.includeStandardAdditions = true;
+
+  // ---- little helpers -------------------------------------------------
+  // single-quote escaping: a directory named  /tmp/$(whoami)  must stay a
+  // directory name and not become a command substitution
+  function shq(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
+
+  function windowIds() {
+    var out = [], ws = Term.windows;
+    for (var i = 0; i < ws.length; i++) { try { out.push(ws[i].id()); } catch (e) {} }
+    return out;
+  }
+  function boundsOf(id) { try { return Term.windows.byId(id).bounds(); } catch (e) { return null; } }
+
+  function writeState(obj) {
+    try {
+      var s = $.NSString.alloc.initWithUTF8String(JSON.stringify(obj));
+      s.writeToFileAtomicallyEncodingError($(a.state), true, $.NSUTF8StringEncoding, null);
+    } catch (e) {}
+  }
+  function readState() {
+    try {
+      var s = $.NSString.stringWithContentsOfFileEncodingError($(a.state), $.NSUTF8StringEncoding, null);
+      return s.isNil() ? null : JSON.parse(ObjC.unwrap(s));
+    } catch (e) { return null; }
+  }
+
+  function place(id, cell) {
+    var win;
+    try { win = Term.windows.byId(id); } catch (e) { return; }
+    // set twice: Terminal quantises to character cells and can clamp on the first pass
+    try { win.bounds = cell; } catch (e) {}
+    try { win.bounds = cell; } catch (e) {}
+  }
+
+  // ---- undo -----------------------------------------------------------
+  if (a.undo) {
+    var prev = readState();
+    if (!prev || !prev.length) { return 'tgrid: nothing to undo'; }
+    Term.activate();
+    var restored = 0;
+    for (var u = 0; u < prev.length; u++) {
+      if (boundsOf(prev[u].id) === null) continue;   // window is gone
+      place(prev[u].id, { x: prev[u].x, y: prev[u].y, width: prev[u].width, height: prev[u].height });
+      restored++;
+    }
+    return 'tgrid: restored ' + restored + ' window(s)';
+  }
+
+  // ---- geometry: visible frame of the target display, flipped to AppleScript coords
+  // (Cocoa: origin bottom-left of the primary screen. AppleScript: origin top-left.)
+  var screens = $.NSScreen.screens;
+  var count = screens.count;
+  var primary = screens.objectAtIndex(0);
+  var flipRef = primary.frame.size.height;
+  function topOf(rect) { return Math.round(flipRef - (rect.origin.y + rect.size.height)); }
+
+  // Terminal refuses to put a window under the menu bar — and with "Displays have
+  // separate Spaces" every display has one, even though only the primary reports
+  // it in visibleFrame. Reserve it everywhere or the bottom row hangs off-screen.
+  var pBottomInset = primary.visibleFrame.origin.y - primary.frame.origin.y;
+  var menuBar = primary.frame.size.height - primary.visibleFrame.size.height - pBottomInset;
+
+  function screenIndexForX(x) {
+    for (var s = 0; s < count; s++) {
+      var fr = screens.objectAtIndex(s).frame;
+      var left = Math.round(fr.origin.x);
+      if (x >= left && x < left + Math.round(fr.size.width)) return s;
+    }
+    return 0;
+  }
+
+  var idx = a.display;
+  if (idx < 0) {
+    // -D next: the display that is NOT holding the frontmost Terminal window
+    var here = 0;
+    try { here = screenIndexForX(Term.windows[0].bounds().x); } catch (e) {}
+    idx = (here + 1) % count;
+  }
+  idx = Math.max(0, Math.min(idx, count - 1));
+
+  var scr = screens.objectAtIndex(idx);
+  var vf = scr.visibleFrame;
+  var X = Math.round(vf.origin.x) + a.pad;
+  var Y = topOf(vf) + a.pad;
+  var W = Math.round(vf.size.width) - 2 * a.pad;
+  var H = Math.round(vf.size.height) - 2 * a.pad;
+
+  var minY = topOf(scr.frame) + menuBar + a.pad;
+  if (Y < minY) { H -= (minY - Y); Y = minY; }
+
+  // ---- decide which windows get tiled.
+  // Always hold on to window IDs, never to windows[i] specifiers: those resolve
+  // lazily by index, and the index shifts while windows are moved/raised — which
+  // makes two cells grab the same window.
+  var targets = [];
+  if (a.reflow) {
+    var all = Term.windows;
+    for (var i = 0; i < all.length; i++) {
+      var w = all[i];
+      try {
+        if (w.miniaturized() || !w.visible()) continue;
+        if (a.here && screenIndexForX(w.bounds().x) !== idx) continue;
+        targets.push(w.id());
+      } catch (e) { continue; }
+    }
+    if (targets.length === 0) {
+      return a.here ? 'tgrid: no Terminal windows on that display'
+                    : 'tgrid: no open Terminal windows to tile';
+    }
+    // Window IDs increase with creation order, so sorting by id makes the
+    // arrangement STABLE: the same session lands in the same cell every time,
+    // instead of following whatever happened to be frontmost.
+    targets.sort(function (p, q) { return p - q; });
+  }
+
+  var dirs = a.dirs.length ? a.dirs : null;
+  var n = a.reflow ? targets.length : (dirs ? dirs.length : a.n);
+  if (!(n >= 1)) { return 'tgrid: nothing to do'; }
+
+  // ---- grid shape: wider than tall, since terminals like columns
+  var cols = a.cols > 0 ? a.cols : Math.ceil(Math.sqrt(n));
+  var rows = a.rows > 0 ? a.rows : Math.ceil(n / cols);
+  if (a.cols > 0 && a.rows === 0) rows = Math.ceil(n / cols);
+  if (a.rows > 0 && a.cols === 0) cols = Math.ceil(n / rows);
+  // A forced grid smaller than the window count used to push the extra windows
+  // off the bottom of the screen. Grow instead of losing them.
+  if (rows * cols < n) rows = Math.ceil(n / cols);
+
+  var g = a.gap;
+  function cellFor(i) {
+    var r = Math.floor(i / cols);
+    var c = i % cols;
+    // last row: stretch the remaining windows across the full width
+    var inRow = (r === rows - 1) ? (n - r * cols) : cols;
+    if (inRow < 1) inRow = cols;
+    var cw = Math.floor((W - g * (inRow - 1)) / inRow);
+    var ch = Math.floor((H - g * (rows - 1)) / rows);
+    return { x: X + c * (cw + g), y: Y + r * (ch + g), width: cw, height: ch };
+  }
+
+  // ---- remember where everything was, so --undo has something to go back to
+  var snapshot = [];
+  var allIds = windowIds();
+  for (var si = 0; si < allIds.length; si++) {
+    var b = boundsOf(allIds[si]);
+    if (b) snapshot.push({ id: allIds[si], x: b.x, y: b.y, width: b.width, height: b.height });
+  }
+  writeState(snapshot);
+
+  Term.activate();
+
+  if (a.reflow) {
+    for (var i = 0; i < targets.length; i++) place(targets[i], cellFor(i));
+    delay(0.2);
+    for (var i2 = 0; i2 < targets.length; i2++) place(targets[i2], cellFor(i2));
+    return 'tgrid: tiled ' + n + ' window(s) into ' + rows + 'x' + cols;
+  }
+
+  // ---- spawn n fresh windows, each its own shell, and place each one
+  var known = {};
+  var pre = windowIds();
+  for (var p = 0; p < pre.length; p++) known[pre[p]] = true;
+
+  var fresh = [];
+  for (var i = 0; i < n; i++) {
+    var d = dirs ? dirs[i] : a.dir;
+    var script = 'cd ' + shq(d) + ' && clear';
+    if (a.cmd && a.cmd.length) script += ' && ' + a.cmd;
+
+    Term.doScript(script);
+    delay(0.15);
+
+    var nowIds = windowIds();
+    for (var j = 0; j < nowIds.length; j++) {
+      if (!known[nowIds[j]]) {
+        known[nowIds[j]] = true;
+        fresh.push(nowIds[j]);
+        place(nowIds[j], cellFor(fresh.length - 1));
+        break;
+      }
+    }
+  }
+
+  // second pass: Terminal settles window sizes lazily after the shell starts
+  delay(0.3);
+  for (var m = 0; m < fresh.length; m++) place(fresh[m], cellFor(m));
+
+  if (fresh.length < n) {
+    return 'tgrid: opened only ' + fresh.length + ' of ' + n + ' window(s) — Terminal refused the rest';
+  }
+  return 'tgrid: opened ' + fresh.length + ' window(s) in a ' + rows + 'x' + cols + ' grid';
+}
+JXA
