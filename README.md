@@ -9,22 +9,13 @@ place. Every time.
 t-GRID does the dragging. One command, or one click from the menu bar, and every
 open Terminal window snaps into a clean grid on the monitor you choose.
 
+![six native Terminal windows tiled 3x2 by t-GRID](docs/grid.png)
+
+*Six real Terminal.app windows, six separate shells, one command: `tgrid 6`.*
+
 That's the whole idea. No tmux, no screen, no Ghostty, no session server, no
 config language, no daemon. Your terminals stay exactly what they were: real,
 separate, native macOS windows.
-
-```
-┌─────────────────┬─────────────────┐
-│                 │                 │
-│   agent · main  │   agent · docs  │
-│                 │                 │
-├─────────────────┼─────────────────┤
-│                 │                 │
-│   build watch   │   server logs   │
-│                 │                 │
-└─────────────────┴─────────────────┘
-        tgrid --reflow
-```
 
 ---
 
