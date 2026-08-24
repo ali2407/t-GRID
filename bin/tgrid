@@ -158,9 +158,27 @@ function run(argv) {
   function place(id, cell) {
     var win;
     try { win = Term.windows.byId(id); } catch (e) { return; }
-    // set twice: Terminal quantises to character cells and can clamp on the first pass
-    try { win.bounds = cell; } catch (e) {}
-    try { win.bounds = cell; } catch (e) {}
+    // Terminal READS and WRITES `bounds` in different coordinate spaces as soon as
+    // a display sits above the primary one: the getter's origin is the top of the
+    // primary screen, the setter's is the top of the whole desktop. With a 1440p
+    // above a 1080p that is a constant 411px — enough to drop the second row on
+    // top of the first, which is exactly what it looked like.
+    //
+    // The offset is not worth hardcoding: it changes with the monitor arrangement.
+    // Place, read back, correct by the difference. Converges in two passes for any
+    // pure translation, and stops on its own when Terminal clamps and cannot land.
+    var want = { x: cell.x, y: cell.y, width: cell.width, height: cell.height };
+    for (var pass = 0; pass < 3; pass++) {
+      // set twice: Terminal quantises to character cells and can clamp on the first
+      try { win.bounds = want; } catch (e) { return; }
+      try { win.bounds = want; } catch (e) {}
+      var got;
+      try { got = win.bounds(); } catch (e) { return; }
+      var dx = cell.x - got.x, dy = cell.y - got.y;
+      if (Math.abs(dx) <= 2 && Math.abs(dy) <= 2) return;
+      want = { x: want.x + dx, y: want.y + dy,
+               width: want.width, height: want.height };
+    }
   }
 
   // ---- undo -----------------------------------------------------------
