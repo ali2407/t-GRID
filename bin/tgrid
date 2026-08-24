@@ -223,25 +223,23 @@ function run(argv) {
   // Always hold on to window IDs, never to windows[i] specifiers: those resolve
   // lazily by index, and the index shifts while windows are moved/raised — which
   // makes two cells grab the same window.
-  var targets = [];
+  var targets = [], where = {};
   if (a.reflow) {
     var all = Term.windows;
     for (var i = 0; i < all.length; i++) {
       var w = all[i];
       try {
         if (w.miniaturized() || !w.visible()) continue;
-        if (a.here && screenIndexForX(w.bounds().x) !== idx) continue;
+        var wb = w.bounds();
+        if (a.here && screenIndexForX(wb.x) !== idx) continue;
         targets.push(w.id());
+        where[w.id()] = { x: wb.x, y: wb.y };
       } catch (e) { continue; }
     }
     if (targets.length === 0) {
       return a.here ? 'tgrid: no Terminal windows on that display'
                     : 'tgrid: no open Terminal windows to tile';
     }
-    // Window IDs increase with creation order, so sorting by id makes the
-    // arrangement STABLE: the same session lands in the same cell every time,
-    // instead of following whatever happened to be frontmost.
-    targets.sort(function (p, q) { return p - q; });
   }
 
   var dirs = a.dirs.length ? a.dirs : null;
@@ -256,6 +254,24 @@ function run(argv) {
   // A forced grid smaller than the window count used to push the extra windows
   // off the bottom of the screen. Grow instead of losing them.
   if (rows * cols < n) rows = Math.ceil(n / cols);
+
+  // ---- order the windows the way you would tidy a desk: reading order, by
+  // where each window ALREADY is. Sorting by window id was stable but arbitrary
+  // — ids follow creation order, so a tidy-up flung sessions across the screen
+  // and looked random. Position ordering means a window moves to the nearest
+  // cell and keeps its place as long as you leave it roughly where it was.
+  if (a.reflow && targets.length > 1) {
+    // Tolerance for "same row". It has to absorb hand-placement drift without
+    // swallowing a real row: half a cell was too generous — it merged two rows
+    // 294px apart and produced column order instead of reading order.
+    var band = 80;
+    targets.sort(function (p, q) {
+      var A = where[p] || { x: 0, y: 0 }, B = where[q] || { x: 0, y: 0 };
+      if (Math.abs(A.y - B.y) > band) return A.y - B.y;
+      if (A.x !== B.x) return A.x - B.x;
+      return p - q;                       // identical spot: fall back to id
+    });
+  }
 
   var g = a.gap;
   function cellFor(i) {

@@ -155,8 +155,15 @@ Two details that took real debugging, in case you're reading the source:
   only the primary reports that inset in `visibleFrame`. Miss it and the bottom
   row of your grid hangs off the bottom of the second monitor.
 
-Windows are tiled in **creation order**, so the same session lands in the same
-cell every time. Sorting twice gives you the same result twice.
+Windows are tiled in **reading order of where they already are** — top-left to
+bottom-right, the way you would tidy a desk. Each window moves to the nearest
+cell rather than to a slot decided somewhere else, so tiling straightens your
+layout instead of reshuffling it, and sorting twice gives you the same result
+twice.
+
+Ordering by window id was tried first. It is just as stable, but ids follow
+creation order, which has nothing to do with what you see — so tidying up flung
+sessions across the screen and looked random.
 
 ---
 
