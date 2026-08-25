@@ -155,6 +155,12 @@ Two details that took real debugging, in case you're reading the source:
   only the primary reports that inset in `visibleFrame`. Miss it and the bottom
   row of your grid hangs off the bottom of the second monitor.
 
+Picking a layout in the menu bar app is a request for that many slots: **Sort
+opens the windows the grid is short of** and then tiles the full set. Four
+windows and a 2x3 gives you six, not four spread across six cells with the last
+row stretched. On Auto the grid follows the window count instead, and nothing
+is opened.
+
 Windows are tiled in **reading order of where they already are** — top-left to
 bottom-right, the way you would tidy a desk. Each window moves to the nearest
 cell rather than to a slot decided somewhere else, so tiling straightens your

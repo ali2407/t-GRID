@@ -21,6 +21,7 @@ GAP=6
 PAD=0
 DISPLAY_IDX=0
 REFLOW=0
+FILL=0
 UNDO=0
 HERE=0
 DIRS=""
@@ -40,6 +41,7 @@ Options
   -p, --pad PX       outer margin around the grid (default: 0)
   -D, --display N    display index, 0 = main; "next" = the other monitor
       --reflow       do not open anything; just tile existing Terminal windows
+      --fill         with --reflow: open the windows the chosen grid is short of
       --here         with --reflow: only tile windows already on the target display
       --undo         restore the window positions from before the last tile
       --version      print version
@@ -71,6 +73,7 @@ while [[ $# -gt 0 ]]; do
                   [[ "$2" == "next" || "$2" == "other" ]] || num "$1" "$2"
                   DISPLAY_IDX="$2"; shift 2 ;;
     --reflow)     REFLOW=1; shift ;;
+    --fill)       FILL=1; shift ;;
     --here)       HERE=1; shift ;;
     --undo)       UNDO=1; shift ;;
     --version)    echo "tgrid $VERSION"; exit 0 ;;
@@ -105,7 +108,7 @@ case "$DISPLAY_IDX" in next|other) DISPLAY_IDX=-1 ;; esac
 # Args are passed positionally — no JSON, no python, nothing to escape wrong.
 osascript -l JavaScript - \
   "$N" "$CMD" "$DIR" "$DIRS" "$ROWS" "$COLS" "$GAP" "$PAD" \
-  "$DISPLAY_IDX" "$REFLOW" "$UNDO" "$HERE" "$STATE" <<'JXA'
+  "$DISPLAY_IDX" "$REFLOW" "$UNDO" "$HERE" "$STATE" "$FILL" <<'JXA'
 function run(argv) {
   ObjC.import('AppKit');
   ObjC.import('Foundation');
@@ -124,7 +127,8 @@ function run(argv) {
     reflow: argv[9] === '1',
     undo: argv[10] === '1',
     here: argv[11] === '1',
-    state: argv[12]
+    state: argv[12],
+    fill: argv[13] === '1'
   };
 
   var Term = Application('Terminal');
@@ -315,6 +319,31 @@ function run(argv) {
   Term.activate();
 
   if (a.reflow) {
+    // A chosen grid is a request for that many slots. Tiling 4 windows into a
+    // 2x3 left two cells empty and stretched the last row across the full
+    // width, which reads as broken. With --fill, open what is missing and hand
+    // back the grid that was actually asked for. New windows go on the END of
+    // the list, so the windows already on screen keep their cells.
+    if (a.fill && rows * cols > targets.length) {
+      var want = rows * cols - targets.length;
+      var seen = {};
+      var before = windowIds();
+      for (var k = 0; k < before.length; k++) seen[before[k]] = true;
+
+      for (var s2 = 0; s2 < want; s2++) {
+        var script = 'cd ' + shq(a.dir) + ' && clear';
+        if (a.cmd && a.cmd.length) script += ' && ' + a.cmd;
+        Term.doScript(script);
+        delay(0.15);
+        var now = windowIds();
+        for (var j2 = 0; j2 < now.length; j2++) {
+          if (!seen[now[j2]]) { seen[now[j2]] = true; targets.push(now[j2]); break; }
+        }
+      }
+      n = targets.length;          // cellFor reads n, so the stretch stops here
+      delay(0.3);                  // Terminal sizes a new window lazily
+    }
+
     for (var i = 0; i < targets.length; i++) place(targets[i], cellFor(i));
     delay(0.2);
     for (var i2 = 0; i2 < targets.length; i2++) place(targets[i2], cellFor(i2));

@@ -221,6 +221,10 @@ final class Model: ObservableObject {
     func sort() {
         var args = ["--reflow"] + gridArgs()
         if onlyHere { args.append("--here") }
+        // An explicitly chosen layout is a request for that many slots, so top up
+        // to it. On Auto the grid follows the window count and there is nothing
+        // to fill — asking would spawn windows the user never asked for.
+        if !isAuto { args += ["--fill", "-d", workDir] }
         runTgrid(args)
     }
 
