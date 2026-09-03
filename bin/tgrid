@@ -7,12 +7,14 @@
 #   tgrid 6          6 windows, 3x2
 #   tgrid 2 -c zsh   2 plain shells
 #   tgrid --reflow   re-tile the Terminal windows that are ALREADY open
+#   tgrid --deck     one window centred, the rest peeking in from the edges
+#   tgrid --next     with the deck: swipe to the next window
 #   tgrid --theme    ...and give every cell its own colour and a clean title bar
 #   tgrid --undo     put them back where they were before the last tile
 #   tgrid --help
 set -euo pipefail
 
-VERSION="1.2"
+VERSION="1.3"
 N=4
 CMD="claude"
 DIR="$PWD"
@@ -28,11 +30,25 @@ HERE=0
 DIRS=""
 THEME="${TGRID_THEME:-0}"      # 0 leave appearance alone · 1 apply · 2 strip
 FONT=0
+DECK=0
+STEP=0
+# The accent palette, single source of truth — the profile writer below needs it
+# to bake the background colour, and the JXA needs it for the cursor.
+# Ordered for neighbours, not for the colour wheel: alternating warm and cool
+# means whichever window you land on, the one beside it looks different.
+ACCENTS="0.424,0.549,1.000;0.914,0.706,0.298;0.184,0.831,0.745;1.000,0.420,0.545;0.420,0.831,0.494;0.655,0.545,0.980;1.000,0.561,0.302;0.298,0.780,0.941"
+GROUND=0.035     # how dark the ground is before the accent is mixed in
+CAST=0.042       # how much accent goes into it
+ALPHA=0.88       # window opacity — the glass
+BLUR=0.55        # how hard the backdrop is blurred behind it
+REPROFILE=0
+MAINPCT=58
+PEEK=150
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/tgrid"
 STATE="$CACHE/last-layout.json"
 
 usage() {
-  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
   cat <<'EOF'
 
 Options
@@ -50,6 +66,13 @@ Options
       --undo         restore the window positions from before the last tile
   -t, --theme        style the windows: one accent per cell, title bar stripped
                      down to what the shell put there, font fitted to the cell
+      --deck         one window centred, the others peeking in from the edges
+      --next         with --deck: bring the next window to the centre
+      --prev         with --deck: bring the previous one
+      --main PCT     width of the centred window, % of the screen (default: 58)
+      --peek PX      how much of the nearest side window stays visible (150)
+      --opaque       theme without the glass — solid windows, no blur
+      --reprofile    rebuild t-GRID's Terminal profiles (after changing the look)
       --plain        undo that — put the windows back on your default profile
       --font PT      font size for --theme (default: fitted to the cell)
       --version      print version
@@ -83,7 +106,14 @@ while [[ $# -gt 0 ]]; do
     --reflow)     REFLOW=1; shift ;;
     --fill)       FILL=1; shift ;;
     --here)       HERE=1; shift ;;
+    --deck)       DECK=1; shift ;;
+    --next)       DECK=1; STEP=1; shift ;;
+    --prev)       DECK=1; STEP=-1; shift ;;
+    --main)       need "$1" "$#" "${2-}"; num "$1" "$2"; MAINPCT="$2"; shift 2 ;;
+    --peek)       need "$1" "$#" "${2-}"; num "$1" "$2"; PEEK="$2"; shift 2 ;;
     -t|--theme)   THEME=1; shift ;;
+    --opaque)     THEME=1; ALPHA=1.0; BLUR=0.0; shift ;;
+    --reprofile)  THEME=1; REPROFILE=1; shift ;;
     --plain)      THEME=2; shift ;;
     --font)       need "$1" "$#" "${2-}"; num "$1" "$2"; FONT="$2"; shift 2 ;;
     --undo)       UNDO=1; shift ;;
@@ -132,25 +162,36 @@ win_ids() {
 }
 
 theme_import() {
-  local name="$1" path="$CACHE/$1.terminal" before
-  # the file name IS the profile name — Terminal ignores the plist's `name` key
-  cat > "$path" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>name</key><string>$name</string>
-  <key>type</key><string>Window Settings</string>
-  <key>ShowRepresentedURLInTitle</key><false/>
-  <key>ShowRepresentedURLPathInTitle</key><false/>
-  <key>ShowActiveProcessInTitle</key><false/>
-  <key>ShowActiveProcessArgumentsInTitle</key><false/>
-  <key>ShowShellCommandInTitle</key><false/>
-  <key>ShowTTYNameInTitle</key><false/>
-  <key>ShowDimensionsInTitle</key><false/>
-  <key>ShowWindowSettingsNameInTitle</key><false/>
-  <key>ShowCommandKeyInTitle</key><false/>
-</dict></plist>
-EOF
+  local name="$1" acc="$2" path="$CACHE/$1.terminal" before
+  # The background colour carries the cell's hue AND the window's opacity, and
+  # opacity is reachable ONLY as the alpha of an archived NSColor. AppleScript's
+  # `background color` takes three components and silently drops the fourth, so
+  # this half has to be written as a real plist and imported.
+  osascript -l JavaScript - "$path" "$name" "$acc" "$GROUND" "$CAST" "$ALPHA" "$BLUR" <<'JXA' >/dev/null 2>&1 || return 1
+function run(argv) {
+  ObjC.import('AppKit'); ObjC.import('Foundation');
+  var path = argv[0], name = argv[1];
+  var acc = argv[2].split(',').map(parseFloat);
+  var ground = parseFloat(argv[3]), cast = parseFloat(argv[4]);
+  var alpha = parseFloat(argv[5]), blur = parseFloat(argv[6]);
+  var col = $.NSColor.colorWithSRGBRedGreenBlueAlpha(
+    ground + acc[0] * cast, ground + acc[1] * cast, ground + acc[2] * cast, alpha);
+  var data = $.NSKeyedArchiver.archivedDataWithRootObjectRequiringSecureCodingError(col, false, null);
+  var d = $.NSMutableDictionary.alloc.init;
+  d.setObjectForKey($(name), $('name'));
+  d.setObjectForKey($('Window Settings'), $('type'));
+  d.setObjectForKey(data, $('BackgroundColor'));
+  d.setObjectForKey($.NSNumber.numberWithDouble(blur), $('BackgroundBlur'));
+  // the title-bar keys that have no AppleScript switch
+  ['ShowRepresentedURLInTitle', 'ShowRepresentedURLPathInTitle',
+   'ShowActiveProcessInTitle', 'ShowActiveProcessArgumentsInTitle',
+   'ShowShellCommandInTitle', 'ShowTTYNameInTitle', 'ShowDimensionsInTitle',
+   'ShowWindowSettingsNameInTitle', 'ShowCommandKeyInTitle'].forEach(function (k) {
+    d.setObjectForKey($.NSNumber.numberWithBool(false), $(k));
+  });
+  return d.writeToFileAtomically($(path), true) ? 'ok' : 'fail';
+}
+JXA
   before="$(win_ids)"
   open -a Terminal "$path" 2>/dev/null || return 1
   osascript -l JavaScript - "$name" "$before" <<'JXA' >/dev/null 2>&1
@@ -188,17 +229,27 @@ JXA
 # Build only the profiles this grid will actually use, so the one-off window
 # flicker is as small as possible. Eight accents is the whole palette.
 theme_setup() {
-  local want="$1" sets i
+  local want="$1" sets i acc
   [[ "$THEME" == "1" ]] || return 0
   (( want > 8 )) && want=8
+  # The look is baked into the profile at import time, so changing it means
+  # throwing the profiles away and building them again.
+  if [[ "$REPROFILE" == "1" ]]; then
+    osascript -l JavaScript -e '
+      var T = Application("Terminal");
+      T.settingsSets.name().forEach(function (n) {
+        if (n.indexOf("t-GRID ") === 0) { try { T.settingsSets.byName(n).delete(); } catch (e) {} }
+      });' >/dev/null 2>&1 || true
+  fi
   sets="$(osascript -l JavaScript -e 'Application("Terminal").settingsSets.name().join("\n")' 2>/dev/null || true)"
   for ((i = 1; i <= want; i++)); do
-    grep -qxF "t-GRID $i" <<< "$sets" || theme_import "t-GRID $i"
+    acc="$(cut -d';' -f"$i" <<< "$ACCENTS")"
+    grep -qxF "t-GRID $i" <<< "$sets" || theme_import "t-GRID $i" "$acc"
   done
 }
 
 if [[ "$THEME" == "1" ]]; then
-  if [[ "$REFLOW" == "1" ]]; then
+  if [[ "$REFLOW" == "1" || "$DECK" == "1" ]]; then
     theme_setup "$(osascript -l JavaScript -e 'Application("Terminal").windows().length' 2>/dev/null || echo 4)"
   elif [[ -n "$DIRS" ]]; then
     theme_setup "$(awk -F, '{print NF}' <<< "$DIRS")"
@@ -213,7 +264,7 @@ case "$DISPLAY_IDX" in next|other) DISPLAY_IDX=-1 ;; esac
 osascript -l JavaScript - \
   "$N" "$CMD" "$DIR" "$DIRS" "$ROWS" "$COLS" "$GAP" "$PAD" \
   "$DISPLAY_IDX" "$REFLOW" "$UNDO" "$HERE" "$STATE" "$FILL" \
-  "$THEME" "$FONT" "$CACHE" <<'JXA'
+  "$THEME" "$FONT" "$CACHE" "$DECK" "$STEP" "$MAINPCT" "$PEEK" "$ACCENTS" <<'JXA'
 function run(argv) {
   ObjC.import('AppKit');
   ObjC.import('Foundation');
@@ -236,7 +287,12 @@ function run(argv) {
     fill: argv[13] === '1',
     theme: parseInt(argv[14], 10),
     font: parseInt(argv[15], 10),
-    cache: argv[16]
+    cache: argv[16],
+    deck: argv[17] === '1',
+    step: parseInt(argv[18], 10),
+    mainPct: Math.max(30, Math.min(90, parseInt(argv[19], 10))),
+    peek: Math.max(30, parseInt(argv[20], 10)),
+    accents: argv[21].split(';').map(function (t) { return t.split(',').map(parseFloat); })
   };
 
   var Term = Application('Terminal');
@@ -297,18 +353,20 @@ function run(argv) {
 
   function boundsOf(id) { try { return Term.windows.byId(id).bounds(); } catch (e) { return null; } }
 
-  function writeState(obj) {
+  function writeJSONFile(path, obj) {
     try {
       var s = $.NSString.alloc.initWithUTF8String(JSON.stringify(obj));
-      s.writeToFileAtomicallyEncodingError($(a.state), true, $.NSUTF8StringEncoding, null);
+      s.writeToFileAtomicallyEncodingError($(path), true, $.NSUTF8StringEncoding, null);
     } catch (e) {}
   }
-  function readState() {
+  function readJSONFile(path) {
     try {
-      var s = $.NSString.stringWithContentsOfFileEncodingError($(a.state), $.NSUTF8StringEncoding, null);
+      var s = $.NSString.stringWithContentsOfFileEncodingError($(path), $.NSUTF8StringEncoding, null);
       return s.isNil() ? null : JSON.parse(ObjC.unwrap(s));
     } catch (e) { return null; }
   }
+  function writeState(obj) { writeJSONFile(a.state, obj); }
+  function readState() { return readJSONFile(a.state); }
 
   function place(id, cell) {
     var win;
@@ -355,20 +413,7 @@ function run(argv) {
   //     registers a real settings set, which can then be handed to windows that
   //     are already open. That last part is the whole trick.
 
-  // Ordered for neighbours, not for the colour wheel. Grouping the two blues and
-  // the two greens together put near-identical cells side by side in a 6-grid;
-  // alternating warm and cool means whichever cell you land on, the one next to
-  // it looks different.
-  var ACCENTS = [
-    [0.424, 0.549, 1.000],   // indigo
-    [0.914, 0.706, 0.298],   // amber
-    [0.184, 0.831, 0.745],   // teal
-    [1.000, 0.420, 0.545],   // rose
-    [0.420, 0.831, 0.494],   // green
-    [0.655, 0.545, 0.980],   // violet
-    [1.000, 0.561, 0.302],   // orange
-    [0.298, 0.780, 0.941]    // sky
-  ];
+  var ACCENTS = a.accents;
   // One neutral text colour everywhere, so reading never changes between cells.
   // The accent is spent in exactly two places: a hue cast in the background you
   // only notice with a neighbour beside it, and the cursor, which is the one
@@ -376,12 +421,6 @@ function run(argv) {
   // headings look like errors.
   var TEXT = [0.780, 0.796, 0.831];
   var BOLD = [0.949, 0.957, 0.973];
-  // Mixed this by eye against the rendered result, not on paper: 0.075 of accent
-  // looked right as numbers and came out as brown and maroon on screen.
-  var GROUND = 0.035, CAST = 0.042;
-  function tint(c) {
-    return [GROUND + c[0] * CAST, GROUND + c[1] * CAST, GROUND + c[2] * CAST];
-  }
   function profileName(i) { return 't-GRID ' + ((i % ACCENTS.length) + 1); }
 
   // Terminal quantises to whole character cells. Solving two measured windows
@@ -411,7 +450,9 @@ function run(argv) {
     try { set = Term.settingsSets.byName(name); } catch (e) { return null; }
     var acc = ACCENTS[i % ACCENTS.length];
     try {
-      set.backgroundColor = tint(acc);
+      // NOT the background: it was baked into the profile at import time,
+      // carrying the window's opacity as its alpha. Writing it from here would
+      // silently drop that and turn the glass solid again.
       set.normalTextColor = TEXT;
       set.boldTextColor   = BOLD;
       set.cursorColor     = acc;
@@ -434,18 +475,116 @@ function run(argv) {
   // theme 1 = dress, 2 = strip back to whatever the user's default profile is.
   // Runs before the final placement pass, because applying a profile resizes the
   // window to that profile's rows and columns.
-  function dress(ids) {
+  function dress(ids, w, h) {
     if (!a.theme) return;
-    var c0 = cellFor(0);
-    var font = a.font > 0 ? a.font : fitFont(c0.width, c0.height);
+    if (w === undefined) { var c0 = cellFor(0); w = c0.width; h = c0.height; }
+    var font = a.font > 0 ? a.font : fitFont(w, h);
     for (var i = 0; i < ids.length; i++) {
       var set = null;
-      if (a.theme === 1) { set = themeFor(i, font, c0.width, c0.height); }
+      if (a.theme === 1) { set = themeFor(i, font, w, h); }
       else { try { set = Term.defaultSettings; } catch (e) {} }
       if (!set) continue;
       try { Term.windows.byId(ids[i]).tabs[0].currentSettings = set; } catch (e) {}
     }
     delay(0.3);
+  }
+
+  // ---- deck: one window centred, the rest peeking in from the edges ------
+  // The grid answers "show me everything at once". The deck answers the other
+  // half of the day: one thing has your attention, the rest should be one
+  // keystroke away and otherwise out of the way. Same windows, same sessions —
+  // only the arithmetic changes.
+  //
+  // The order is a RING, held in the cache, so --next walks the same sequence
+  // every time instead of jumping around by whatever is frontmost. Windows that
+  // have closed since drop out; new ones join the end.
+  function deckPath() { return a.cache + '/deck.json'; }
+
+  function deckRing(ids) {
+    var st = readJSONFile(deckPath()), ring = [];
+    if (st && st.ring) {
+      for (var i = 0; i < st.ring.length; i++) {
+        if (ids.indexOf(st.ring[i]) >= 0 && ring.indexOf(st.ring[i]) < 0) ring.push(st.ring[i]);
+      }
+    }
+    for (var j = 0; j < ids.length; j++) { if (ring.indexOf(ids[j]) < 0) ring.push(ids[j]); }
+    return ring;
+  }
+
+  function runDeck(ids, X, Y, W, H) {
+    var ring = deckRing(ids);
+    var n = ring.length;
+    if (!n) { return 'tgrid: no Terminal windows to deck'; }
+
+    var st = readJSONFile(deckPath());
+    var cur = 0;
+    if (st && typeof st.cur === 'number' && st.ring) {
+      // follow the window that was centred last, not its old index — the ring
+      // may have lost or gained members since
+      var was = st.ring[st.cur];
+      var seat = ring.indexOf(was);
+      if (seat >= 0) cur = seat;
+    } else {
+      // first deck of the session: centre whatever is already frontmost, so
+      // this rearranges around you instead of yanking a different session up
+      try {
+        var front = Term.windows[0].id();
+        var f = ring.indexOf(front);
+        if (f >= 0) cur = f;
+      } catch (e) {}
+    }
+    if (a.step) cur = ((cur + a.step) % n + n) % n;
+
+    var mainW = Math.round(W * a.mainPct / 100);
+    var inset = n > 1 ? 26 : 0;          // side windows sit a little inside the
+                                         // main one, which is what reads as depth
+    var main = { x: X + Math.round((W - mainW) / 2), y: Y, width: mainW, height: H };
+
+    // Depth 1 shows `peek` pixels; each one behind it shows less and sits further
+    // off the edge, so a stack of five still looks like a stack and not a smear.
+    function side(dir, depth) {
+      var vis = Math.max(34, a.peek - Math.min(depth - 1, 4) * 34);
+      return {
+        x: dir > 0 ? (X + W - vis) : (X + vis - mainW),
+        y: Y + inset,
+        width: mainW,
+        height: H - 2 * inset
+      };
+    }
+
+    // Walk out from the centre alternating right, left, right, left …
+    function at(offset) { return ring[((cur + offset) % n + n) % n]; }
+    var plan = [];
+    for (var k = 1; k < n; k++) {
+      var dir = (k % 2) ? 1 : -1;
+      var depth = Math.ceil(k / 2);
+      plan.push({ id: at(dir * depth), cell: side(dir, depth), depth: depth });
+    }
+
+    Term.activate();
+    // Dress by RING order, not by where a window happens to sit right now.
+    // Colouring by position would repaint every window on every swipe, which
+    // destroys the one thing the colour is for: staying the same.
+    if (a.theme) dress(ring, main.width, main.height);
+
+    // Place and raise from the back forward, so the nearer window of a stack
+    // ends up on top of the one behind it, and the centred one on top of all.
+    plan.sort(function (p, q) { return q.depth - p.depth; });
+    for (var i = 0; i < plan.length; i++) {
+      place(plan[i].id, plan[i].cell);
+      try { Term.windows.byId(plan[i].id).frontmost = true; } catch (e) {}
+    }
+    place(ring[cur], main);
+    delay(0.15);
+    for (var r = 0; r < plan.length; r++) place(plan[r].id, plan[r].cell);
+    place(ring[cur], main);
+    try { Term.windows.byId(ring[cur]).frontmost = true; } catch (e) {}
+
+    writeJSONFile(deckPath(), { ring: ring, cur: cur });
+
+    var name = '';
+    try { name = Term.windows.byId(ring[cur]).name(); } catch (e) {}
+    return 'tgrid: deck of ' + n + ' — ' + (name || 'window ' + ring[cur]) + ' in the middle';
   }
 
   // ---- undo -----------------------------------------------------------
@@ -476,6 +615,17 @@ function run(argv) {
   var pBottomInset = primary.visibleFrame.origin.y - primary.frame.origin.y;
   var menuBar = primary.frame.size.height - primary.visibleFrame.size.height - pBottomInset;
 
+  // A window belongs to a display if it OVERLAPS it, not if its left edge
+  // happens to land inside it. The deck deliberately pushes its side windows
+  // past the edge into negative coordinates, and an origin-only test then
+  // decides they live on the next monitor along — so --here quietly dropped
+  // them and the deck shrank by two windows on every swipe.
+  function overlapsScreen(b, i) {
+    var fr = screens.objectAtIndex(i).frame;
+    var left = Math.round(fr.origin.x), right = left + Math.round(fr.size.width);
+    return b.x < right && (b.x + b.width) > left;
+  }
+
   function screenIndexForX(x) {
     for (var s = 0; s < count; s++) {
       var fr = screens.objectAtIndex(s).frame;
@@ -504,19 +654,39 @@ function run(argv) {
   var minY = topOf(scr.frame) + menuBar + a.pad;
   if (Y < minY) { H -= (minY - Y); Y = minY; }
 
+  if (a.deck) {
+    var deckIds = [];
+    var dws = Term.windows;
+    for (var di = 0; di < dws.length; di++) {
+      try {
+        if (dws[di].miniaturized() || !dws[di].visible()) continue;
+        if (a.here && !overlapsScreen(dws[di].bounds(), idx)) continue;
+        deckIds.push(dws[di].id());
+      } catch (e) {}
+    }
+    if (!deckIds.length) return 'tgrid: no Terminal windows to deck';
+    var snap = [];
+    windowIds().forEach(function (id) {
+      var b = boundsOf(id);
+      if (b) snap.push({ id: id, x: b.x, y: b.y, width: b.width, height: b.height });
+    });
+    writeState(snap);
+    return runDeck(deckIds, X, Y, W, H);
+  }
+
   // ---- decide which windows get tiled.
   // Always hold on to window IDs, never to windows[i] specifiers: those resolve
   // lazily by index, and the index shifts while windows are moved/raised — which
   // makes two cells grab the same window.
   var targets = [], where = {};
-  if (a.reflow) {
+  if (a.reflow || a.deck) {
     var all = Term.windows;
     for (var i = 0; i < all.length; i++) {
       var w = all[i];
       try {
         if (w.miniaturized() || !w.visible()) continue;
         var wb = w.bounds();
-        if (a.here && screenIndexForX(wb.x) !== idx) continue;
+        if (a.here && !overlapsScreen(wb, idx)) continue;
         targets.push(w.id());
         where[w.id()] = { x: wb.x, y: wb.y };
       } catch (e) { continue; }
@@ -545,7 +715,7 @@ function run(argv) {
   // — ids follow creation order, so a tidy-up flung sessions across the screen
   // and looked random. Position ordering means a window moves to the nearest
   // cell and keeps its place as long as you leave it roughly where it was.
-  if (a.reflow && targets.length > 1) {
+  if ((a.reflow || a.deck) && targets.length > 1) {
     // Tolerance for "same row". It has to absorb hand-placement drift without
     // swallowing a real row: half a cell was too generous — it merged two rows
     // 294px apart and produced column order instead of reading order.

@@ -231,6 +231,16 @@ final class Model: ObservableObject {
         runTgrid(args)
     }
 
+    // The deck: one window centred, the rest parked at the edges. step 0 lays it
+    // out, ±1 walks the ring.
+    func deck(_ step: Int = 0) {
+        var args = [step == 0 ? "--deck" : (step > 0 ? "--next" : "--prev"),
+                    "-D", String(display)]
+        if onlyHere { args.append("--here") }
+        if theme { args.append("--theme") }
+        runTgrid(args)
+    }
+
     func newGrid() {
         var args = [String(newCount), "-d", workDir] + gridArgs()
         if theme { args.append("--theme") }
@@ -398,6 +408,19 @@ struct Panel: View {
             }
 
             VStack(spacing: 6) {
+                HStack(spacing: 6) {
+                    Button { m.deck() } label: {
+                        Label("Deck", systemImage: "rectangle.portrait.on.rectangle.portrait")
+                            .frame(maxWidth: .infinity)
+                    }
+                    Button { m.deck(-1) } label: { Image(systemName: "chevron.left") }
+                        .help("Previous window to the middle")
+                    Button { m.deck(1) } label: { Image(systemName: "chevron.right") }
+                        .help("Next window to the middle")
+                }
+                .disabled(m.working || m.toolMissing)
+                .padding(.bottom, 4)
+
                 Button { m.sort() } label: {
                     Label("Sort open terminals", systemImage: "rectangle.3.group")
                         .frame(maxWidth: .infinity)

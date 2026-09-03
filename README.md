@@ -1,6 +1,6 @@
 # t-GRID
 
-**A grid for your native macOS terminals. No multiplexer.**
+**Two ways to arrange your native macOS terminals. No multiplexer.**
 
 You open four Terminal windows, each running its own thing — an agent here, a
 build there, a server, a shell. Then you spend a minute dragging them into
@@ -67,6 +67,8 @@ tgrid                    # open 4 new windows in a 2×2, each running `claude`
 tgrid 6                  # 6 windows, 3×2
 tgrid 2 -c zsh           # 2 plain shells instead
 tgrid --reflow --theme   # ...and give every cell its own colour and a clean title
+tgrid --deck             # one window centred, the rest peeking in at the edges
+tgrid --next             # swipe the deck along
 tgrid --undo             # put everything back where it was
 ```
 
@@ -88,6 +90,12 @@ Everything else:
 | `-t, --theme` | colour each cell, strip the title bar, fit the font to the cell |
 | `--plain` | undo that — put the windows back on your default profile |
 | `--font PT` | font size for `--theme` (default: fitted to the cell) |
+| `--deck` | one window centred, the others peeking in from the edges |
+| `--next` / `--prev` | move the deck one window along |
+| `--main PCT` | width of the centred window, % of the screen (default 58) |
+| `--peek PX` | how much of the nearest side window stays visible (default 150) |
+| `--opaque` | theme without the glass — solid windows, no blur |
+| `--reprofile` | rebuild t-GRID's profiles after changing the look |
 
 A few combinations worth knowing:
 
@@ -103,6 +111,35 @@ Set `TGRID_THEME=1` in your shell profile if you want `--theme` to be the defaul
 
 ---
 
+## Two views
+
+**The grid** shows you everything at once. Good when you're supervising — six
+agents running, and you want to catch the one that stopped.
+
+**The deck** is the other half of the day: one session has your attention, the
+rest should be one keystroke away and otherwise out of the way. The focused
+window sits centred and large; the others wait at the edges with a strip
+showing, stacked so the one behind peeks out a little less than the one in
+front.
+
+```sh
+tgrid --deck            # centre whatever is frontmost, park the rest
+tgrid --next            # bring the next window to the middle
+tgrid --prev            # and back
+tgrid --deck --main 70  # give the centred window more of the screen
+tgrid --deck --peek 220 # let more of the side windows show
+```
+
+The order is a **ring** kept between runs, so `--next` walks the same sequence
+every time instead of jumping to whatever happens to be frontmost. Windows that
+you close drop out of it; new ones join the end. `--undo` still puts everything
+back.
+
+Both views are the same windows and the same sessions. Only the arithmetic
+changes — switch between them as often as you like.
+
+---
+
 ## The terminal design
 
 Six tiled terminals have a problem tiling alone doesn't fix: they are six
@@ -114,6 +151,10 @@ albert — ◑ 100k integration plan files — caffeinate ◂ claude — 116×43
 ```
 
 The part you actually want is in the middle. `--theme` deals with both.
+
+**Every window is dark glass.** Translucent, with the desktop behind it blurred
+out — so a window reads as a pane you can see depth through rather than a black
+rectangle. `--opaque` if you'd rather have neither.
 
 **Every cell gets its own ground.** A near-black tinted with one of eight
 accents, and a cursor in that accent. Text stays the same neutral grey in every
@@ -134,9 +175,14 @@ picked so the cell still holds about 100 columns. A dense grid gives you smaller
 type instead of an agent UI clipped down the right-hand side. `--font 11` if you
 disagree.
 
+In the deck the accent follows the window's place in the **ring**, not where it
+is standing right now — otherwise every swipe would repaint everything, which
+destroys the one thing a colour is for.
+
 t-GRID does this with Terminal profiles of its own, named `t-GRID 1` … `t-GRID
 8`. Your own profiles are never touched, and `--plain` puts every window back on
-your default.
+your default. The glass is baked into the profile when it is built, so after
+changing `--opaque` you need `--reprofile` to rebuild them.
 
 ---
 
@@ -238,7 +284,12 @@ sessions across the screen and looked random.
 - Minimized windows are skipped.
 - The layout is a one-shot arrangement, not a managed tiling mode. New windows
   you open afterwards land wherever Terminal puts them until you sort again.
-- No global hotkey yet.
+- **No custom window chrome.** Terminal.app has no API for it, so t-GRID cannot
+  draw a header bar with an icon inside a window the way a native app would.
+  What it can do is take the standard title bar over completely, which is what
+  `--theme` does. A real header would have to be a floating panel drawn on top
+  by TGrid.app.
+- No global hotkey yet, so `--next` needs the menu bar app or a shell alias.
 - `--theme` styles the window, not the session. Colours follow the cell, so a
   window that moves cells changes colour — they name a position in the grid,
   not a project.
