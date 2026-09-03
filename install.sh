@@ -5,9 +5,10 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SRC="$HERE/bin/tgrid"
+QSRC="$HERE/bin/tgrid-queue"
 
 [[ "$(uname)" == "Darwin" ]] || { echo "t-GRID is macOS only."; exit 1; }
-chmod +x "$SRC" "$HERE/app/build.sh"
+chmod +x "$SRC" "$QSRC" "$HERE/app/build.sh"
 
 # pick the first directory that is on PATH and writable
 TARGET=""
@@ -23,6 +24,11 @@ fi
 
 ln -sf "$SRC" "$TARGET/tgrid"
 echo "installed: $TARGET/tgrid  ->  $SRC"
+# tgrid-queue is linked beside tgrid on purpose: `tgrid --queue` follows the
+# symlink back to the checkout to find it, and the menu bar app looks for it
+# next to whichever tgrid it found.
+ln -sf "$QSRC" "$TARGET/tgrid-queue"
+echo "installed: $TARGET/tgrid-queue  ->  $QSRC"
 
 if command -v swiftc >/dev/null; then
   read -r -p "Build the menu bar app too? [Y/n] " reply
