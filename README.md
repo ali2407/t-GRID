@@ -118,9 +118,17 @@ agents running, and you want to catch the one that stopped.
 
 **The deck** is the other half of the day: one session has your attention, the
 rest should be one keystroke away and otherwise out of the way. The focused
-window sits centred and large; the others wait at the edges with a strip
-showing, stacked so the one behind peeks out a little less than the one in
-front.
+window sits centred and large; the others stack behind it, each stepped a little
+further out than the one in front, so you can see how many are waiting and grab
+one by clicking its edge.
+
+Everything stays on **one display**. The first version pushed the side windows to
+the screen edges so that only a strip showed, which looks right on a single
+monitor and is wrong on every other setup: a side window is as wide as the
+centred one, so a strip at the edge means the other 90% of it hangs past the
+edge — and past the edge is your second monitor. Resizing them to fit would be
+worse, because a narrow Terminal reflows the agent UI inside it and these are
+live sessions. Position and z-order are free; size is not.
 
 ```sh
 tgrid --deck            # centre whatever is frontmost, park the rest

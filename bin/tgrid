@@ -14,7 +14,7 @@
 #   tgrid --help
 set -euo pipefail
 
-VERSION="1.6"
+VERSION="1.7"
 N=4
 CMD="claude"
 DIR="$PWD"
@@ -48,7 +48,7 @@ ALPHA=1.0
 BLUR=0.0
 REPROFILE=0
 MAINPCT=58
-PEEK=150
+PEEK=96
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/tgrid"
 STATE="$CACHE/last-layout.json"
 
@@ -75,7 +75,7 @@ Options
       --next         with --deck: bring the next window to the centre
       --prev         with --deck: bring the previous one
       --main PCT     width of the centred window, % of the screen (default: 58)
-      --peek PX      how much of the nearest side window stays visible (150)
+      --peek PX      how far each stacked window steps out (default: 96)
       --glass        translucent windows with a blurred backdrop (softens text)
       --reprofile    rebuild t-GRID's Terminal profiles (after changing the look)
       --palette      print the accent colours as hex, one per line
@@ -565,12 +565,29 @@ function run(argv) {
                                          // main one, which is what reads as depth
     var main = { x: X + Math.round((W - mainW) / 2), y: Y, width: mainW, height: H };
 
-    // Depth 1 shows `peek` pixels; each one behind it shows less and sits further
-    // off the edge, so a stack of five still looks like a stack and not a smear.
+    // The side windows CASCADE out from behind the centred one, and every one of
+    // them stays inside this display.
+    //
+    // The first version pushed them to the screen edges instead, so that only a
+    // strip showed — which looks right on a single monitor and is wrong on any
+    // other setup. A window is as wide as the centred one, so a strip at the edge
+    // means the other 90% of it hangs past the edge — and "past the edge" is not
+    // empty space, it is Alberto's second monitor. Every side window landed on top
+    // of the work on the other screen. On his layout ALL FOUR of them did.
+    //
+    // Resizing them to fit would be the other way out, and it is worse: a narrow
+    // Terminal reflows the agent UI inside it, and these are live sessions. Only
+    // position and z-order are free. So they stack behind the centre instead, each
+    // one stepped a little further out than the one in front of it.
+    var deepest = { 1: Math.ceil((n - 1) / 2), '-1': Math.floor((n - 1) / 2) };
     function side(dir, depth) {
-      var vis = Math.max(34, a.peek - Math.min(depth - 1, 4) * 34);
+      var margin = dir > 0 ? (X + W) - (main.x + mainW) : main.x - X;
+      var levels = Math.max(1, deepest[dir] || 1);
+      // share the margin out over however many cards are on this side, so the
+      // furthest one still lands inside the screen
+      var step = Math.max(18, Math.min(a.peek, Math.floor(margin / levels)));
       return {
-        x: dir > 0 ? (X + W - vis) : (X + vis - mainW),
+        x: main.x + dir * step * depth,
         y: Y + inset,
         width: mainW,
         height: H - 2 * inset
