@@ -186,6 +186,37 @@ changing `--opaque` you need `--reprofile` to rebuild them.
 
 ---
 
+## Nameplates
+
+Terminal.app has no API for custom chrome, so nothing can draw a header *inside*
+its window. What nothing stops you doing is putting a panel of your own *on top*
+of one.
+
+Turn on **Nameplates** in the menu bar app and every Terminal window gets a
+small bar parked exactly over its title bar, between the traffic lights and
+Terminal's own split button: an icon in the window's accent, the session name,
+what's running in it, and a green dot while it's busy.
+
+```
+ ● ● ●   [✦] LANDING · claude                                          ●
+```
+
+The plate is **click-through**. That matters more than it sounds: the title bar
+underneath keeps working, so the window still drags, double-click still zooms,
+and nothing about Terminal behaves differently because there is a picture
+floating over it.
+
+It needs no extra permission. Window rectangles come from the public window list
+— no screen recording, no accessibility — and the names come over the same
+Apple Events the panel already uses. Geometry is followed 5×/second so a dragged
+window doesn't leave its plate behind; names refresh once a second and a half,
+because those cost an Apple Event and the name rarely changes.
+
+Agents write a spinner glyph into their title (`✳ LANDING`). That glyph becomes
+the plate's icon rather than being printed twice.
+
+---
+
 ## The menu bar app
 
 Optional, and the same thing with a face on it. `install.sh` builds it, or:
@@ -202,6 +233,8 @@ Click the grid symbol and you get:
   same cell again to go back to *Auto*.
 - **Colour each cell, strip the title bar** — the checkbox next to the monitor.
   The same thing `--theme` does on the CLI.
+- **Nameplates over the title bars** — the overlay described above.
+- **Deck** with `‹ ›` — the deck view, and swiping it along.
 - **Sort open terminals** — the button. Everything open, snapped into place.
 - **New grid of N** — spawns that many fresh sessions, already tiled, in a
   folder you pick.
@@ -284,11 +317,8 @@ sessions across the screen and looked random.
 - Minimized windows are skipped.
 - The layout is a one-shot arrangement, not a managed tiling mode. New windows
   you open afterwards land wherever Terminal puts them until you sort again.
-- **No custom window chrome.** Terminal.app has no API for it, so t-GRID cannot
-  draw a header bar with an icon inside a window the way a native app would.
-  What it can do is take the standard title bar over completely, which is what
-  `--theme` does. A real header would have to be a floating panel drawn on top
-  by TGrid.app.
+- **Nameplates need the app running.** They are drawn by TGrid.app, so they
+  live and die with it. The CLI alone cannot draw anything on screen.
 - No global hotkey yet, so `--next` needs the menu bar app or a shell alias.
 - `--theme` styles the window, not the session. Colours follow the cell, so a
   window that moves cells changes colour — they name a position in the grid,

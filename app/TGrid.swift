@@ -104,6 +104,13 @@ final class Model: ObservableObject {
     @Published var gap: Int      { didSet { d.set(gap, forKey: "gap") } }
     @Published var onlyHere: Bool { didSet { d.set(onlyHere, forKey: "onlyHere") } }
     @Published var theme: Bool   { didSet { d.set(theme, forKey: "theme") } }
+    @Published var plates: Bool  {
+        didSet {
+            d.set(plates, forKey: "plates")
+            plates ? nameplates.start() : nameplates.stop()
+        }
+    }
+    let nameplates = Nameplates()
     @Published var workDir: String { didSet { d.set(workDir, forKey: "workDir") } }
 
     private let d = UserDefaults.standard
@@ -116,8 +123,11 @@ final class Model: ObservableObject {
         gap      = d.object(forKey: "gap") as? Int ?? 6
         onlyHere = d.object(forKey: "onlyHere") as? Bool ?? false
         theme    = d.object(forKey: "theme") as? Bool ?? false
+        plates   = d.object(forKey: "plates") as? Bool ?? false
         workDir  = d.object(forKey: "workDir") as? String ?? NSHomeDirectory()
         if !FileManager.default.fileExists(atPath: workDir) { workDir = NSHomeDirectory() }
+        if plates { nameplates.start() }      // a setting that survives a restart
+                                              // has to actually come back up
     }
 
     var isAuto: Bool { rows == 0 || cols == 0 }
@@ -294,6 +304,279 @@ final class Model: ObservableObject {
 
 // MARK: - grid picker
 
+// MARK: - nameplates
+//
+// Terminal.app has no API for custom chrome, so nothing can draw a header
+// INSIDE its window. What nothing stops you doing is putting a panel of your own
+// on top of one. Each plate is a borderless floating panel parked exactly over
+// its window's title bar, between the traffic lights and Terminal's own split
+// button, showing an icon, the session name and its accent.
+//
+// The plate is click-through (`ignoresMouseEvents`). That matters more than it
+// sounds: the title bar underneath keeps working, so the window still drags,
+// double-click still zooms, and nothing about Terminal behaves differently
+// because there is a picture floating over it.
+
+struct PlateView: View {
+    let name: String
+    let sub: String
+    let accent: Color
+    let symbol: String
+    let busy: Bool
+
+    var body: some View {
+        HStack(spacing: 7) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 4.5, style: .continuous)
+                    .fill(accent.opacity(0.20))
+                Image(systemName: symbol)
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(accent)
+            }
+            .frame(width: 17, height: 17)
+
+            Text(name)
+                .font(.system(size: 11.5, weight: .semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+
+            if !sub.isEmpty {
+                Text("·").font(.system(size: 11)).foregroundStyle(.tertiary)
+                Text(sub)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+            if busy {
+                Circle().fill(Color.green.opacity(0.9)).frame(width: 6, height: 6)
+            }
+        }
+        .padding(.horizontal, 8)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(accent.opacity(0.16))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .strokeBorder(accent.opacity(0.30), lineWidth: 0.5)
+                )
+        )
+    }
+}
+
+final class NameplatePanel: NSPanel {
+    init() {
+        super.init(contentRect: NSRect(x: 0, y: 0, width: 200, height: 22),
+                   styleMask: [.borderless, .nonactivatingPanel],
+                   backing: .buffered, defer: false)
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = false
+        level = .floating
+        ignoresMouseEvents = true            // the title bar underneath still works
+        collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenNone]
+        isReleasedWhenClosed = false
+    }
+}
+
+struct PlateInfo {
+    var name: String
+    var rawName: String
+    var sub: String
+    var accent: Int      // 1-based index into the t-GRID palette, 0 = untinted
+    var busy: Bool
+}
+
+@MainActor
+final class Nameplates {
+    private var panels: [CGWindowID: NameplatePanel] = [:]
+    private var info: [CGWindowID: PlateInfo] = [:]
+    private var geometryTimer: Timer?
+    private var infoTimer: Timer?
+    private var palette: [Color] = []
+    private(set) var running = false
+
+    // Terminal's title bar, and the two zones of it that belong to Terminal:
+    // the traffic lights on the left and the split-pane button on the right.
+    private let barHeight: CGFloat = 28
+    private let leftInset: CGFloat = 76
+    private let rightInset: CGFloat = 34
+
+    func start() {
+        guard !running else { return }
+        running = true
+        loadPalette()
+        // Geometry is cheap and needs no permission, so it can run often enough
+        // that a dragged window does not leave its plate behind. Titles come from
+        // Apple Events, which are not cheap, so they run on their own slow timer.
+        geometryTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.syncGeometry() }
+        }
+        infoTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refreshInfo() }
+        }
+        syncGeometry()
+        refreshInfo()
+    }
+
+    func stop() {
+        running = false
+        geometryTimer?.invalidate(); geometryTimer = nil
+        infoTimer?.invalidate(); infoTimer = nil
+        for (_, p) in panels { p.orderOut(nil) }
+        panels.removeAll()
+        info.removeAll()
+    }
+
+    /// One palette, defined in `tgrid`. Asking the tool for it beats keeping a
+    /// second copy here that drifts the first time the colours are tuned.
+    private func loadPalette() {
+        let r = Shell.run(Shell.tgrid, ["--palette"], timeout: 5)
+        palette = r.output.split(separator: "\n").compactMap { Color(hex: String($0)) }
+    }
+
+    private func terminalWindows() -> [(id: CGWindowID, frame: CGRect)] {
+        let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let raw = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]]
+        else { return [] }
+        return raw.compactMap { w in
+            guard (w[kCGWindowOwnerName as String] as? String) == "Terminal",
+                  (w[kCGWindowLayer as String] as? Int) == 0,
+                  let n = w[kCGWindowNumber as String] as? CGWindowID,
+                  let b = w[kCGWindowBounds as String] as? [String: CGFloat],
+                  let x = b["X"], let y = b["Y"], let width = b["Width"], let height = b["Height"],
+                  width > 220, height > 120
+            else { return nil }
+            return (n, CGRect(x: x, y: y, width: width, height: height))
+        }
+    }
+
+    private func syncGeometry() {
+        let live = terminalWindows()
+        let ids = Set(live.map { $0.id })
+
+        for (id, panel) in panels where !ids.contains(id) {
+            panel.orderOut(nil)
+            panels.removeValue(forKey: id)
+        }
+        guard let primary = NSScreen.screens.first else { return }
+        let screenTop = primary.frame.maxY
+
+        for w in live {
+            let panel = panels[w.id] ?? {
+                let p = NameplatePanel()
+                panels[w.id] = p
+                return p
+            }()
+            let width = max(90, w.frame.width - leftInset - rightInset)
+            // CGWindowList is flipped (origin top-left of the primary screen);
+            // AppKit is not. Convert, or every plate lands mirrored down the screen.
+            let rect = NSRect(x: w.frame.minX + leftInset,
+                              y: screenTop - w.frame.minY - barHeight + 3,
+                              width: width, height: barHeight - 6)
+            if panel.frame != rect { panel.setFrame(rect, display: false) }
+
+            let meta = info[w.id] ?? PlateInfo(name: "Terminal", rawName: "", sub: "", accent: 0, busy: false)
+            let accent = (meta.accent > 0 && meta.accent <= palette.count)
+                ? palette[meta.accent - 1] : Color.secondary
+            panel.contentView = NSHostingView(
+                rootView: PlateView(name: meta.name, sub: meta.sub, accent: accent,
+                                    symbol: Self.symbol(for: meta.rawName), busy: meta.busy))
+            if !panel.isVisible { panel.orderFront(nil) }
+        }
+    }
+
+    /// Claude Code and friends write a spinner glyph into the title. It becomes
+    /// the plate's icon — and then has to come OUT of the text, or every plate
+    /// reads "✳ ✳ LANDING" with the same mark twice.
+    nonisolated static let agentGlyphs: Set<Character> = ["✳", "✻", "✽", "◐", "◑", "◒", "◓", "*", "·"]
+
+    nonisolated static func symbol(for title: String) -> String {
+        let head = title.prefix(2)
+        return head.contains(where: { agentGlyphs.contains($0) }) ? "sparkles" : "terminal"
+    }
+
+    nonisolated static func strip(_ title: String) -> String {
+        var t = Substring(title)
+        while let f = t.first, agentGlyphs.contains(f) || f == " " { t = t.dropFirst() }
+        return t.isEmpty ? title : String(t)
+    }
+
+    private func refreshInfo() {
+        let js = """
+        var T = Application('Terminal'); var out = [];
+        for (var i = 0; i < T.windows.length; i++) {
+          var w = T.windows[i];
+          try {
+            if (w.miniaturized()) continue;
+            var t = w.tabs[0];
+            out.push({ id: w.id(), name: w.name(),
+                       set: (function(){ try { return t.currentSettings.name(); } catch(e){ return ''; } })(),
+                       procs: (function(){ try { return t.processes(); } catch(e){ return []; } })(),
+                       busy: (function(){ try { return t.busy(); } catch(e){ return false; } })() });
+          } catch (e) {}
+        }
+        JSON.stringify(out)
+        """
+        Task.detached(priority: .utility) {
+            let raw = Shell.jxa(js)
+            guard let data = raw.output.data(using: .utf8),
+                  let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+            else { return }
+            var next: [CGWindowID: PlateInfo] = [:]
+            for row in arr {
+                guard let id = row["id"] as? Int else { continue }
+                let raw = (row["name"] as? String) ?? "Terminal"
+                let set = (row["set"] as? String) ?? ""
+                var accent = 0
+                if set.hasPrefix("t-GRID "), let n = Int(set.dropFirst(7)) { accent = n }
+                // A themed window's title is already just the session name. An
+                // unthemed one is still Apple's "dir - task - proc - 116x43", so
+                // pull the middle out rather than showing the whole string.
+                let parts = raw.components(separatedBy: " — ")
+                let titled = (accent > 0 ? raw : (parts.count > 1 ? parts[1] : raw))
+                // What is running in there is worth the width — but the LAST
+                // process is wrong: an agent spawns helpers, so a Claude Code
+                // window reported "Python" (an MCP server) in all six plates.
+                // The one you mean is the first thing the shell itself launched.
+                let procs = (row["procs"] as? [String]) ?? []
+                let shells: Set<String> = ["login", "zsh", "-zsh", "bash", "-bash", "sh", "fish", "-fish"]
+                let proc = procs
+                    .map { p -> String in
+                        let base = (p as NSString).lastPathComponent
+                        return base.hasPrefix("-") ? String(base.dropFirst()) : base
+                    }
+                    .first { !shells.contains($0) } ?? ""
+                next[CGWindowID(id)] = PlateInfo(name: Nameplates.strip(titled),
+                                                 rawName: titled,
+                                                 sub: proc, accent: accent,
+                                                 busy: (row["busy"] as? Bool) ?? false)
+            }
+            let result = next
+            await MainActor.run { self.info = result }
+        }
+    }
+}
+
+extension Color {
+    /// #RRGGBB as printed by `tgrid --palette`.
+    init?(hex: String) {
+        var s = hex.trimmingCharacters(in: .whitespaces)
+        if s.hasPrefix("#") { s.removeFirst() }
+        guard s.count == 6, let v = Int(s, radix: 16) else { return nil }
+        self.init(.sRGB,
+                  red: Double((v >> 16) & 0xFF) / 255,
+                  green: Double((v >> 8) & 0xFF) / 255,
+                  blue: Double(v & 0xFF) / 255,
+                  opacity: 1)
+    }
+}
+
 struct GridPicker: View {
     @Binding var rows: Int
     @Binding var cols: Int
@@ -398,6 +681,9 @@ struct Panel: View {
                         .toggleStyle(.checkbox)
                         .font(.system(size: 10))
                     Toggle("Colour each cell, strip the title bar", isOn: $m.theme)
+                        .toggleStyle(.checkbox)
+                        .font(.system(size: 10))
+                    Toggle("Nameplates over the title bars", isOn: $m.plates)
                         .toggleStyle(.checkbox)
                         .font(.system(size: 10))
                 }

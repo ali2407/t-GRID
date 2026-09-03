@@ -14,7 +14,7 @@
 #   tgrid --help
 set -euo pipefail
 
-VERSION="1.3"
+VERSION="1.4"
 N=4
 CMD="claude"
 DIR="$PWD"
@@ -73,6 +73,7 @@ Options
       --peek PX      how much of the nearest side window stays visible (150)
       --opaque       theme without the glass — solid windows, no blur
       --reprofile    rebuild t-GRID's Terminal profiles (after changing the look)
+      --palette      print the accent colours as hex, one per line
       --plain        undo that — put the windows back on your default profile
       --font PT      font size for --theme (default: fitted to the cell)
       --version      print version
@@ -117,6 +118,16 @@ while [[ $# -gt 0 ]]; do
     --plain)      THEME=2; shift ;;
     --font)       need "$1" "$#" "${2-}"; num "$1" "$2"; FONT="$2"; shift 2 ;;
     --undo)       UNDO=1; shift ;;
+    --palette)    # one accent per line as hex — so anything drawing UI on top of
+                  # these windows (the nameplates) uses the same colours instead
+                  # of keeping its own copy that drifts
+                  # LC_ALL=C: under a comma-decimal locale awk reads 0.424 as 0,
+                  # which silently turns the whole palette into pure primaries
+                  LC_ALL=C awk -v pal="$ACCENTS" 'BEGIN{
+                    n=split(pal,a,";");
+                    for(i=1;i<=n;i++){split(a[i],c,",");
+                      printf "#%02X%02X%02X\n", int(c[1]*255+0.5), int(c[2]*255+0.5), int(c[3]*255+0.5)}}'
+                  exit 0 ;;
     --version)    echo "tgrid $VERSION"; exit 0 ;;
     -h|--help)    usage; exit 0 ;;
     [0-9]*)       num "count" "$1"; N="$1"; shift ;;
