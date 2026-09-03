@@ -66,6 +66,7 @@ tgrid --reflow           # tile the Terminal windows that are already open
 tgrid                    # open 4 new windows in a 2×2, each running `claude`
 tgrid 6                  # 6 windows, 3×2
 tgrid 2 -c zsh           # 2 plain shells instead
+tgrid --reflow --theme   # ...and give every cell its own colour and a clean title
 tgrid --undo             # put everything back where it was
 ```
 
@@ -84,6 +85,9 @@ Everything else:
 | `--reflow` | tile what's already open instead of opening anything |
 | `--here` | with `--reflow`: only windows already on the target monitor |
 | `--undo` | restore the positions from before the last tile |
+| `-t, --theme` | colour each cell, strip the title bar, fit the font to the cell |
+| `--plain` | undo that — put the windows back on your default profile |
+| `--font PT` | font size for `--theme` (default: fitted to the cell) |
 
 A few combinations worth knowing:
 
@@ -92,7 +96,47 @@ tgrid --reflow -D next            # throw the whole grid onto the other monitor
 tgrid --reflow --here -D 1        # tidy monitor 2 without disturbing monitor 1
 tgrid --dirs ~/api,~/web,~/infra  # three projects, three windows, one command
 tgrid 8 -r 2 -k 4 -g 0            # dense 2×4, no gaps
+tgrid --reflow --theme            # tidy up and style what's already open
 ```
+
+Set `TGRID_THEME=1` in your shell profile if you want `--theme` to be the default.
+
+---
+
+## The terminal design
+
+Six tiled terminals have a problem tiling alone doesn't fix: they are six
+identical dark rectangles, and the only glanceable text on them is a title bar
+that reads
+
+```
+albert — ◑ 100k integration plan files — caffeinate ◂ claude — 116×43
+```
+
+The part you actually want is in the middle. `--theme` deals with both.
+
+**Every cell gets its own ground.** A near-black tinted with one of eight
+accents, and a cursor in that accent. Text stays the same neutral grey in every
+window, so reading never changes; the colour is spent on the background — which
+you only notice when a neighbour is beside it — and on the cursor, which is the
+thing you hunt for. Bold stays neutral on purpose: tinting it would make a red
+cell's headings look like errors. The palette alternates warm and cool rather
+than running round the colour wheel, so no two neighbouring cells look alike.
+
+**The title bar loses everything but the title.** `albert —` is the folder
+proxy, `— -zsh` the running process, `— 116×43` the window size. What's left is
+whatever the session put there — which for an agent is the task it's working on.
+New windows are named `3 · myproject` on the way in, so a plain shell has
+something to say too; anything that runs afterwards is free to overwrite it.
+
+**The font fits the cell.** A 2×2 gets 16pt, a 3×2 gets 12, a 4×2 gets 9 — each
+picked so the cell still holds about 100 columns. A dense grid gives you smaller
+type instead of an agent UI clipped down the right-hand side. `--font 11` if you
+disagree.
+
+t-GRID does this with Terminal profiles of its own, named `t-GRID 1` … `t-GRID
+8`. Your own profiles are never touched, and `--plain` puts every window back on
+your default.
 
 ---
 
@@ -110,6 +154,8 @@ Click the grid symbol and you get:
 - **Monitor** — your displays drawn to their real shape. Click one.
 - **Layout** — hover a cell to sweep out a `3 × 2`, click to lock it, click the
   same cell again to go back to *Auto*.
+- **Colour each cell, strip the title bar** — the checkbox next to the monitor.
+  The same thing `--theme` does on the CLI.
 - **Sort open terminals** — the button. Everything open, snapped into place.
 - **New grid of N** — spawns that many fresh sessions, already tiled, in a
   folder you pick.
@@ -154,6 +200,16 @@ Two details that took real debugging, in case you're reading the source:
   "Displays have separate Spaces" enabled each screen has its own menu bar, but
   only the primary reports that inset in `visibleFrame`. Miss it and the bottom
   row of your grid hangs off the bottom of the second monitor.
+- **Half of the title bar has no AppleScript switch.** Colours, font and four
+  title flags are settable on a Terminal profile. The folder proxy and the
+  process name are not — they exist only in the profile's plist, so setting
+  every switch AppleScript exposes changes nothing you can see. A profile that
+  hides them has to be *born* from a `.terminal` file. The useful part is that
+  importing one registers a real profile, which can then be handed to windows
+  that are already open.
+- **`close()` on a window whose shell is still running does nothing.** Terminal
+  puts up a confirmation sheet instead of failing, so the call reports success
+  and the window stays. Exit the shell first, then close.
 
 Picking a layout in the menu bar app is a request for that many slots: **Sort
 opens the windows the grid is short of** and then tiles the full set. Four
@@ -183,6 +239,12 @@ sessions across the screen and looked random.
 - The layout is a one-shot arrangement, not a managed tiling mode. New windows
   you open afterwards land wherever Terminal puts them until you sort again.
 - No global hotkey yet.
+- `--theme` styles the window, not the session. Colours follow the cell, so a
+  window that moves cells changes colour — they name a position in the grid,
+  not a project.
+- The first themed run builds one Terminal profile per accent, and importing a
+  profile costs a window that opens and closes again. It takes a few seconds,
+  once.
 
 ---
 

@@ -103,6 +103,7 @@ final class Model: ObservableObject {
     @Published var cols: Int     { didSet { d.set(cols, forKey: "cols") } }
     @Published var gap: Int      { didSet { d.set(gap, forKey: "gap") } }
     @Published var onlyHere: Bool { didSet { d.set(onlyHere, forKey: "onlyHere") } }
+    @Published var theme: Bool   { didSet { d.set(theme, forKey: "theme") } }
     @Published var workDir: String { didSet { d.set(workDir, forKey: "workDir") } }
 
     private let d = UserDefaults.standard
@@ -114,6 +115,7 @@ final class Model: ObservableObject {
         cols     = d.object(forKey: "cols") as? Int ?? 0
         gap      = d.object(forKey: "gap") as? Int ?? 6
         onlyHere = d.object(forKey: "onlyHere") as? Bool ?? false
+        theme    = d.object(forKey: "theme") as? Bool ?? false
         workDir  = d.object(forKey: "workDir") as? String ?? NSHomeDirectory()
         if !FileManager.default.fileExists(atPath: workDir) { workDir = NSHomeDirectory() }
     }
@@ -225,11 +227,14 @@ final class Model: ObservableObject {
         // to it. On Auto the grid follows the window count and there is nothing
         // to fill — asking would spawn windows the user never asked for.
         if !isAuto { args += ["--fill", "-d", workDir] }
+        if theme { args.append("--theme") }
         runTgrid(args)
     }
 
     func newGrid() {
-        runTgrid([String(newCount), "-d", workDir] + gridArgs())
+        var args = [String(newCount), "-d", workDir] + gridArgs()
+        if theme { args.append("--theme") }
+        runTgrid(args)
     }
 
     func undo() { runTgrid(["--undo"]) }
@@ -238,8 +243,12 @@ final class Model: ObservableObject {
         guard !working else { return }
         working = true
         let tool = Shell.tgrid
+        // The first themed run imports a Terminal profile per accent, and every
+        // import costs a window that has to open and close again. That is well
+        // past the default timeout, and it only ever happens once.
+        let limit: TimeInterval = args.contains("--theme") ? 90 : 25
         Task.detached(priority: .userInitiated) {
-            let r = Shell.run(tool, args)
+            let r = Shell.run(tool, args, timeout: limit)
             await MainActor.run {
                 self.status = r.output.replacingOccurrences(of: "tgrid: ", with: "")
                 self.failed = !r.ok
@@ -376,6 +385,9 @@ struct Panel: View {
                 VStack(alignment: .leading, spacing: 6) {
                     DisplayPicker(displays: m.displays, selected: $m.display)
                     Toggle("Only windows already on this monitor", isOn: $m.onlyHere)
+                        .toggleStyle(.checkbox)
+                        .font(.system(size: 10))
+                    Toggle("Colour each cell, strip the title bar", isOn: $m.theme)
                         .toggleStyle(.checkbox)
                         .font(.system(size: 10))
                 }

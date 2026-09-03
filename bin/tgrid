@@ -7,11 +7,12 @@
 #   tgrid 6          6 windows, 3x2
 #   tgrid 2 -c zsh   2 plain shells
 #   tgrid --reflow   re-tile the Terminal windows that are ALREADY open
+#   tgrid --theme    ...and give every cell its own colour and a clean title bar
 #   tgrid --undo     put them back where they were before the last tile
 #   tgrid --help
 set -euo pipefail
 
-VERSION="1.1"
+VERSION="1.2"
 N=4
 CMD="claude"
 DIR="$PWD"
@@ -25,10 +26,13 @@ FILL=0
 UNDO=0
 HERE=0
 DIRS=""
-STATE="${XDG_CACHE_HOME:-$HOME/.cache}/tgrid/last-layout.json"
+THEME="${TGRID_THEME:-0}"      # 0 leave appearance alone · 1 apply · 2 strip
+FONT=0
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/tgrid"
+STATE="$CACHE/last-layout.json"
 
 usage() {
-  sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
   cat <<'EOF'
 
 Options
@@ -44,6 +48,10 @@ Options
       --fill         with --reflow: open the windows the chosen grid is short of
       --here         with --reflow: only tile windows already on the target display
       --undo         restore the window positions from before the last tile
+  -t, --theme        style the windows: one accent per cell, title bar stripped
+                     down to what the shell put there, font fitted to the cell
+      --plain        undo that — put the windows back on your default profile
+      --font PT      font size for --theme (default: fitted to the cell)
       --version      print version
   -h, --help         this
 EOF
@@ -75,6 +83,9 @@ while [[ $# -gt 0 ]]; do
     --reflow)     REFLOW=1; shift ;;
     --fill)       FILL=1; shift ;;
     --here)       HERE=1; shift ;;
+    -t|--theme)   THEME=1; shift ;;
+    --plain)      THEME=2; shift ;;
+    --font)       need "$1" "$#" "${2-}"; num "$1" "$2"; FONT="$2"; shift 2 ;;
     --undo)       UNDO=1; shift ;;
     --version)    echo "tgrid $VERSION"; exit 0 ;;
     -h|--help)    usage; exit 0 ;;
@@ -101,14 +112,108 @@ if [[ -n "$DIRS" ]]; then
   DIRS="${resolved%,}"
 fi
 
-mkdir -p "$(dirname "$STATE")"
+mkdir -p "$CACHE"
+
+# ---- t-GRID's own Terminal profiles ----------------------------------------
+# Colours and font can be set on a profile over AppleScript. The title bar
+# cannot: `albert —` is the represented-URL proxy and `— -zsh` the active
+# process name, and both live ONLY in the profile plist — setting every title
+# switch AppleScript exposes changes nothing you can see. So each profile has to
+# be BORN from a `.terminal` file that carries those keys.
+#
+# Importing one means opening it, and that `open` has to happen HERE rather than
+# from inside the JXA below: while our own script is holding Terminal inside an
+# Apple Event, Terminal never gets round to processing the open, and the profile
+# silently never appears. Costs one throwaway window per profile, once ever.
+win_ids() {
+  osascript -l JavaScript -e \
+    'Application("Terminal").windows().map(function(w){try{return w.id()}catch(e){return ""}}).join(",")' \
+    2>/dev/null || true
+}
+
+theme_import() {
+  local name="$1" path="$CACHE/$1.terminal" before
+  # the file name IS the profile name — Terminal ignores the plist's `name` key
+  cat > "$path" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>name</key><string>$name</string>
+  <key>type</key><string>Window Settings</string>
+  <key>ShowRepresentedURLInTitle</key><false/>
+  <key>ShowRepresentedURLPathInTitle</key><false/>
+  <key>ShowActiveProcessInTitle</key><false/>
+  <key>ShowActiveProcessArgumentsInTitle</key><false/>
+  <key>ShowShellCommandInTitle</key><false/>
+  <key>ShowTTYNameInTitle</key><false/>
+  <key>ShowDimensionsInTitle</key><false/>
+  <key>ShowWindowSettingsNameInTitle</key><false/>
+  <key>ShowCommandKeyInTitle</key><false/>
+</dict></plist>
+EOF
+  before="$(win_ids)"
+  open -a Terminal "$path" 2>/dev/null || return 1
+  osascript -l JavaScript - "$name" "$before" <<'JXA' >/dev/null 2>&1
+function run(argv) {
+  ObjC.import('Foundation');
+  var name = argv[0], before = {};
+  argv[1].split(',').forEach(function (s) { if (s) before[s] = true; });
+  var T = Application('Terminal');
+  function delay(s) { $.NSThread.sleepForTimeInterval(s); }
+  function ids() {
+    var o = [], ws = T.windows;
+    for (var i = 0; i < ws.length; i++) { try { o.push(ws[i].id()); } catch (e) {} }
+    return o;
+  }
+  var ok = false;
+  for (var i = 0; i < 50 && !ok; i++) {
+    delay(0.1);
+    try { ok = T.settingsSets.name().indexOf(name) >= 0; } catch (e) {}
+  }
+  delay(0.2);
+  // The window the import opened is litter. Terminal will not close a window
+  // whose shell is still running — it puts up a sheet instead of failing, so
+  // close() reports success and nothing happens. Exit the shell first.
+  var strays = ids().filter(function (id) { return !before[id]; });
+  strays.forEach(function (id) {
+    try { T.doScript('exit', { in: T.windows.byId(id).tabs[0] }); } catch (e) {}
+  });
+  if (strays.length) delay(1.2);
+  strays.forEach(function (id) { try { T.windows.byId(id).close(); } catch (e) {} });
+  return ok ? 'ok' : 'timeout';
+}
+JXA
+}
+
+# Build only the profiles this grid will actually use, so the one-off window
+# flicker is as small as possible. Eight accents is the whole palette.
+theme_setup() {
+  local want="$1" sets i
+  [[ "$THEME" == "1" ]] || return 0
+  (( want > 8 )) && want=8
+  sets="$(osascript -l JavaScript -e 'Application("Terminal").settingsSets.name().join("\n")' 2>/dev/null || true)"
+  for ((i = 1; i <= want; i++)); do
+    grep -qxF "t-GRID $i" <<< "$sets" || theme_import "t-GRID $i"
+  done
+}
+
+if [[ "$THEME" == "1" ]]; then
+  if [[ "$REFLOW" == "1" ]]; then
+    theme_setup "$(osascript -l JavaScript -e 'Application("Terminal").windows().length' 2>/dev/null || echo 4)"
+  elif [[ -n "$DIRS" ]]; then
+    theme_setup "$(awk -F, '{print NF}' <<< "$DIRS")"
+  else
+    theme_setup "$N"
+  fi
+fi
 
 case "$DISPLAY_IDX" in next|other) DISPLAY_IDX=-1 ;; esac
 
 # Args are passed positionally — no JSON, no python, nothing to escape wrong.
 osascript -l JavaScript - \
   "$N" "$CMD" "$DIR" "$DIRS" "$ROWS" "$COLS" "$GAP" "$PAD" \
-  "$DISPLAY_IDX" "$REFLOW" "$UNDO" "$HERE" "$STATE" "$FILL" <<'JXA'
+  "$DISPLAY_IDX" "$REFLOW" "$UNDO" "$HERE" "$STATE" "$FILL" \
+  "$THEME" "$FONT" "$CACHE" <<'JXA'
 function run(argv) {
   ObjC.import('AppKit');
   ObjC.import('Foundation');
@@ -128,7 +233,10 @@ function run(argv) {
     undo: argv[10] === '1',
     here: argv[11] === '1',
     state: argv[12],
-    fill: argv[13] === '1'
+    fill: argv[13] === '1',
+    theme: parseInt(argv[14], 10),
+    font: parseInt(argv[15], 10),
+    cache: argv[16]
   };
 
   var Term = Application('Terminal');
@@ -139,11 +247,54 @@ function run(argv) {
   // directory name and not become a command substitution
   function shq(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
 
+  function baseName(p) {
+    var t = String(p).replace(/\/+$/, '');
+    var i = t.lastIndexOf('/');
+    return (i >= 0 ? t.slice(i + 1) : t) || '/';
+  }
+
+  // Stripping the title bar down to the custom title is only an improvement if
+  // something puts a custom title there. An agent does — Claude Code writes the
+  // task it is on — but a plain shell writes nothing, and the window would just
+  // say "Terminal". So name it on the way in: cell number and folder. Anything
+  // running afterwards is free to overwrite it, which is the point.
+  function titleCmd(i, dir) {
+    var t = (i + 1) + ' · ' + baseName(dir);
+    return "printf " + shq('\\033]0;' + t.replace(/[\x00-\x1f]/g, '') + '\\007');
+  }
+
   function windowIds() {
     var out = [], ws = Term.windows;
     for (var i = 0; i < ws.length; i++) { try { out.push(ws[i].id()); } catch (e) {} }
     return out;
   }
+  // Which window did doScript just create? Diffing window ids was the obvious
+  // answer and it is subtly wrong: Terminal's window list can come back short
+  // for a call — a session parked on another display's Space went missing for
+  // exactly one enumeration — and then an id that had been there all along
+  // looks new. The result is that a window you were working in gets adopted
+  // into the grid and resized under you. doScript hands back the TAB it made,
+  // and a tty is unique, so ask the tab which window it lives in. Id diffing
+  // stays on as the fallback.
+  function windowForTab(tab, known) {
+    var tty = null;
+    try { tty = tab.tty(); } catch (e) {}
+    if (tty) {
+      var ws = Term.windows;
+      for (var i = 0; i < ws.length; i++) {
+        try {
+          var ts = ws[i].tabs;
+          for (var j = 0; j < ts.length; j++) {
+            if (ts[j].tty() === tty) return ws[i].id();
+          }
+        } catch (e) {}
+      }
+    }
+    var now = windowIds();
+    for (var k = 0; k < now.length; k++) { if (!known[now[k]]) return now[k]; }
+    return null;
+  }
+
   function boundsOf(id) { try { return Term.windows.byId(id).bounds(); } catch (e) { return null; } }
 
   function writeState(obj) {
@@ -183,6 +334,118 @@ function run(argv) {
       want = { x: want.x + dx, y: want.y + dy,
                width: want.width, height: want.height };
     }
+  }
+
+
+  // ---- terminal design -------------------------------------------------
+  // Six identical dark rectangles read as one wall of text. The theme gives
+  // every cell in the grid its own near-black tint and a matching cursor, and
+  // strips the title bar back to what the shell actually put there.
+  //
+  // It takes two layers, because Terminal splits the job in an unobvious place:
+  //
+  //   * Colours and font ARE settable on a settings set over AppleScript, and a
+  //     set created that way inherits a working ANSI palette — so agent output
+  //     keeps its reds and greens. No plist surgery needed for any of that.
+  //   * The noisy half of the title has NO AppleScript switch. `albert —` is
+  //     the represented-URL proxy and `— -zsh` the active process name; both
+  //     live only in the profile plist. Setting every title flag AppleScript
+  //     does expose changes nothing you can see. The profile therefore has to
+  //     be BORN from a `.terminal` file carrying those keys — and importing one
+  //     registers a real settings set, which can then be handed to windows that
+  //     are already open. That last part is the whole trick.
+
+  // Ordered for neighbours, not for the colour wheel. Grouping the two blues and
+  // the two greens together put near-identical cells side by side in a 6-grid;
+  // alternating warm and cool means whichever cell you land on, the one next to
+  // it looks different.
+  var ACCENTS = [
+    [0.424, 0.549, 1.000],   // indigo
+    [0.914, 0.706, 0.298],   // amber
+    [0.184, 0.831, 0.745],   // teal
+    [1.000, 0.420, 0.545],   // rose
+    [0.420, 0.831, 0.494],   // green
+    [0.655, 0.545, 0.980],   // violet
+    [1.000, 0.561, 0.302],   // orange
+    [0.298, 0.780, 0.941]    // sky
+  ];
+  // One neutral text colour everywhere, so reading never changes between cells.
+  // The accent is spent in exactly two places: a hue cast in the background you
+  // only notice with a neighbour beside it, and the cursor, which is the one
+  // thing you hunt for. Bold stays neutral — tinting it would make a red cell's
+  // headings look like errors.
+  var TEXT = [0.780, 0.796, 0.831];
+  var BOLD = [0.949, 0.957, 0.973];
+  // Mixed this by eye against the rendered result, not on paper: 0.075 of accent
+  // looked right as numbers and came out as brown and maroon on screen.
+  var GROUND = 0.035, CAST = 0.042;
+  function tint(c) {
+    return [GROUND + c[0] * CAST, GROUND + c[1] * CAST, GROUND + c[2] * CAST];
+  }
+  function profileName(i) { return 't-GRID ' + ((i % ACCENTS.length) + 1); }
+
+  // Terminal quantises to whole character cells. Solving two measured windows
+  // (849x702 = 116x43 and 597x409 = 80x24, both at 11pt) gives a column of
+  // 0.6364*size points and a row of 1.402*size, plus ~37pt of chrome across and
+  // ~39pt down. So this is arithmetic, not a guess. Pick the largest size that
+  // still leaves TARGET_COLS columns: a denser grid gets smaller type instead of
+  // an agent UI clipped down the right-hand side.
+  var COL_W = 0.6364, ROW_H = 1.402, CHROME_W = 37, CHROME_H = 39;
+  var TARGET_COLS = 100, MIN_ROWS = 20;
+  function fitFont(w, h) {
+    var byW = (w - CHROME_W) / (COL_W * TARGET_COLS);
+    var byH = (h - CHROME_H) / (ROW_H * MIN_ROWS);
+    return Math.max(9, Math.min(16, Math.floor(Math.min(byW, byH))));
+  }
+
+  function settingsNames() { try { return Term.settingsSets.name(); } catch (e) { return []; } }
+
+  // Paint the profile for cell i. The profiles themselves were imported by the
+  // shell half of this script before we got here; if one is missing, that cell
+  // simply keeps the look it had. Profiles are t-GRID's own — Basic and Pro are
+  // never touched.
+  function themeFor(i, font, w, h) {
+    var name = profileName(i);
+    if (settingsNames().indexOf(name) < 0) return null;
+    var set;
+    try { set = Term.settingsSets.byName(name); } catch (e) { return null; }
+    var acc = ACCENTS[i % ACCENTS.length];
+    try {
+      set.backgroundColor = tint(acc);
+      set.normalTextColor = TEXT;
+      set.boldTextColor   = BOLD;
+      set.cursorColor     = acc;
+      set.fontName = 'SFMono-Regular';
+      set.fontSize = font;
+      // Sizing the profile to the cell keeps the window from jumping when the
+      // profile lands; place() still has the final word.
+      set.numberOfColumns = Math.max(20, Math.floor((w - CHROME_W) / (COL_W * font)));
+      set.numberOfRows    = Math.max(10, Math.floor((h - CHROME_H) / (ROW_H * font)));
+      // the half of the title bar AppleScript can reach — the plist did the rest
+      set.titleDisplaysDeviceName   = false;
+      set.titleDisplaysShellPath    = false;
+      set.titleDisplaysWindowSize   = false;
+      set.titleDisplaysSettingsName = false;
+      set.titleDisplaysCustomTitle  = true;
+    } catch (e) {}
+    return set;
+  }
+
+  // theme 1 = dress, 2 = strip back to whatever the user's default profile is.
+  // Runs before the final placement pass, because applying a profile resizes the
+  // window to that profile's rows and columns.
+  function dress(ids) {
+    if (!a.theme) return;
+    var c0 = cellFor(0);
+    var font = a.font > 0 ? a.font : fitFont(c0.width, c0.height);
+    for (var i = 0; i < ids.length; i++) {
+      var set = null;
+      if (a.theme === 1) { set = themeFor(i, font, c0.width, c0.height); }
+      else { try { set = Term.defaultSettings; } catch (e) {} }
+      if (!set) continue;
+      try { Term.windows.byId(ids[i]).tabs[0].currentSettings = set; } catch (e) {}
+    }
+    delay(0.3);
   }
 
   // ---- undo -----------------------------------------------------------
@@ -332,18 +595,18 @@ function run(argv) {
 
       for (var s2 = 0; s2 < want; s2++) {
         var script = 'cd ' + shq(a.dir) + ' && clear';
+        if (a.theme === 1) script += ' && ' + titleCmd(targets.length, a.dir);
         if (a.cmd && a.cmd.length) script += ' && ' + a.cmd;
-        Term.doScript(script);
+        var tabF = Term.doScript(script);
         delay(0.15);
-        var now = windowIds();
-        for (var j2 = 0; j2 < now.length; j2++) {
-          if (!seen[now[j2]]) { seen[now[j2]] = true; targets.push(now[j2]); break; }
-        }
+        var idF = windowForTab(tabF, seen);
+        if (idF !== null && !seen[idF]) { seen[idF] = true; targets.push(idF); }
       }
       n = targets.length;          // cellFor reads n, so the stretch stops here
       delay(0.3);                  // Terminal sizes a new window lazily
     }
 
+    dress(targets);
     for (var i = 0; i < targets.length; i++) place(targets[i], cellFor(i));
     delay(0.2);
     for (var i2 = 0; i2 < targets.length; i2++) place(targets[i2], cellFor(i2));
@@ -359,24 +622,23 @@ function run(argv) {
   for (var i = 0; i < n; i++) {
     var d = dirs ? dirs[i] : a.dir;
     var script = 'cd ' + shq(d) + ' && clear';
+    if (a.theme === 1) script += ' && ' + titleCmd(i, d);
     if (a.cmd && a.cmd.length) script += ' && ' + a.cmd;
 
-    Term.doScript(script);
+    var tab = Term.doScript(script);
     delay(0.15);
 
-    var nowIds = windowIds();
-    for (var j = 0; j < nowIds.length; j++) {
-      if (!known[nowIds[j]]) {
-        known[nowIds[j]] = true;
-        fresh.push(nowIds[j]);
-        place(nowIds[j], cellFor(fresh.length - 1));
-        break;
-      }
+    var wid = windowForTab(tab, known);
+    if (wid !== null && !known[wid]) {
+      known[wid] = true;
+      fresh.push(wid);
+      place(wid, cellFor(fresh.length - 1));
     }
   }
 
   // second pass: Terminal settles window sizes lazily after the shell starts
   delay(0.3);
+  dress(fresh);
   for (var m = 0; m < fresh.length; m++) place(fresh[m], cellFor(m));
 
   if (fresh.length < n) {
