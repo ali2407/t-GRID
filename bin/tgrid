@@ -15,7 +15,7 @@
 #   tgrid --help
 set -euo pipefail
 
-VERSION="1.9"
+VERSION="2.0"
 N=4
 CMD="claude"
 DIR="$PWD"
@@ -51,7 +51,7 @@ CAST=0.042       # how much accent goes into it
 ALPHA=0.82
 BLUR=0.7
 REPROFILE=0
-MAINPCT=64
+MAINPCT=63
 PEEK=52
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/tgrid"
 STATE="$CACHE/last-layout.json"
@@ -639,35 +639,40 @@ function run(argv) {
     }
     if (a.step) cur = ((cur + a.step) % n + n) % n;
 
+    // Geometry taken off the reference: a centred card at ~63% of the width and
+    // ~86% of the height, floating with desktop above and below it, and a narrow
+    // card at each screen edge with a real GAP between it and the middle one.
+    //
+    // The gap is the whole thing. Two earlier versions avoided resizing the
+    // parked windows — first by pushing them off the screen edge (which on a
+    // second monitor means dumping them on the other display), then by hiding
+    // them behind the centred card (safe, no spill, and no gap either, so the
+    // three windows ran together into one slab of text and it stopped looking
+    // like cards at all). A card that is flush behind the middle one cannot have
+    // a gap; the strip it shows runs from the screen edge to the middle card's
+    // edge by definition.
+    //
+    // So the parked cards ARE resized, into the margin, and they are resized back
+    // when they come to the middle. That costs a reflow of the agent UI in a
+    // window that is not being worked in, which is the cheaper of the two prices.
     var mainW = Math.round(W * a.mainPct / 100);
-    var margin = Math.floor((W - mainW) / 2);          // what shows of a parked card
-    var mainInset = n > 1 ? 16 : 0;                    // the centred card floats
-    var cardInset = n > 1 ? 44 : 0;                    // parked ones sit further back
-    var main = { x: X + margin, y: Y + mainInset, width: mainW, height: H - 2 * mainInset };
+    var mainH = Math.round(H * 0.86);
+    var main = { x: X + Math.round((W - mainW) / 2),
+                 y: Y + Math.round((H - mainH) / 2),
+                 width: mainW, height: mainH };
 
-    // A parked card shows a strip at the screen edge and is otherwise hidden.
-    //
-    // The obvious way to do that is to push it OFF the edge — and that is what the
-    // first version did. It is wrong on any machine with a second monitor: the
-    // hidden 80% of the window does not vanish, it lands on the next screen along.
-    // On Alberto's layout every parked card covered the other display.
-    //
-    // The trick is that a card hidden behind the CENTRED one looks exactly the
-    // same as a card hanging off the screen — you cannot see either part. So park
-    // it flush with the display edge and let its body extend INWARD, behind the
-    // middle card. Same picture, nothing off-screen, and nothing gets resized:
-    // a narrow Terminal reflows the agent UI inside it, and these are live
-    // sessions. Position and z-order are free; size is not.
-    //
-    // Deeper cards step back from the edge, so each shows a little less than the
-    // one in front of it.
+    var gap = 52;
+    var cardW = Math.max(180, Math.floor((W - mainW) / 2) - gap);
+    var cardH = Math.round(mainH * 0.88);
+    var cardY = Y + Math.round((H - cardH) / 2);
+
+    // Cards behind the front one step in a little so you can see there are more
+    // of them, without turning the edge into a fan.
     function card(dir, depth) {
-      var back = Math.min((depth - 1) * a.peek, Math.max(0, margin - 40));
+      var back = Math.min(depth - 1, 3) * 14;
       return {
-        x: dir > 0 ? (X + W - mainW - back) : (X + back),
-        y: Y + cardInset,
-        width: mainW,
-        height: H - 2 * cardInset
+        x: dir > 0 ? (X + W - cardW + back) : (X - back),
+        y: cardY, width: cardW, height: cardH
       };
     }
     var side = card;

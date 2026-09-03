@@ -886,19 +886,22 @@ function run(argv) {
   var T = Application('Terminal');
   function delay(s) { $.NSThread.sleepForTimeInterval(s); }
 
-  // Position only. NEVER width/height: resizing a Terminal window running a TUI
-  // makes Claude Code reflow its whole transcript, and these are live sessions.
-  // Every move re-sends the size the window already reports.
-  function move(id, x, y) {
+  // Position AND size. Keeping the windows at whatever size they happened to be
+  // was the safe choice and it made the queue unreadable: six grid-sized windows
+  // nudged 34px apart look like a pile, not a line. A queue only reads as a queue
+  // if the front card is plainly the front card. Resizing costs a reflow of the
+  // agent UI in windows that are not being worked in — the cheaper price.
+  function move(id, x, y, w_, h_) {
     var w;
     try { w = T.windows.byId(id); } catch (e) { return; }
     for (var pass = 0; pass < 3; pass++) {
       var got;
       try { got = w.bounds(); } catch (e) { return; }
+      var W = w_ || got.width, H = h_ || got.height;
       // Terminal reads bounds relative to the primary screen's top and writes
       // them relative to the whole desktop's top. The offset depends on the
       // monitor arrangement, so converge on it instead of hardcoding it.
-      try { w.bounds = { x: x, y: y, width: got.width, height: got.height }; } catch (e) { return; }
+      try { w.bounds = { x: x, y: y, width: W, height: H }; } catch (e) { return; }
       var now;
       try { now = w.bounds(); } catch (e) { return; }
       var dx = x - now.x, dy = y - now.y;
@@ -911,7 +914,7 @@ function run(argv) {
   // Back of the line first, so each window ends up on top of the one behind it
   // and the front of the queue ends up on top of everything.
   for (var i = plan.length - 1; i >= 0; i--) {
-    if (plan[i].x !== null) move(plan[i].id, plan[i].x, plan[i].y);
+    if (plan[i].x !== null) move(plan[i].id, plan[i].x, plan[i].y, plan[i].w, plan[i].h);
     try { T.windows.byId(plan[i].id).frontmost = true; } catch (e) {}
   }
   if (plan.length) {
@@ -964,20 +967,32 @@ def stage(q, display=None):
     top = prim["h"] - (s["vy"] + s["vh"])
     X, Y, W, H = int(s["vx"]), int(round(top)), int(s["vw"]), int(s["vh"])
 
-    tall = max((it["height"] for it in items), default=0)
+    # One card size for everyone, so the stack is a stack and not a pile. The
+    # front card is what you read; the ones behind only need to show their title
+    # bar, because that is where t-GRID's nameplate — rank, wait, and the one
+    # sentence — is drawn. Six raised hands above the card you are answering.
     slots = len(items) - 1
-    headroom = max(0, H - tall)
-    step = 0 if slots == 0 else min(34, headroom // slots)
-    if step and step < 26:
-        step = 0                      # less than a title bar shows nothing useful
-    dx = 14 if step else 0
+    step = 36
+    while slots and Y + slots * step > Y + H * 0.42:
+        step -= 2                       # a very long queue tightens up instead of
+        if step <= 12:                  # pushing the front card off the bottom
+            break
+    cardW = int(W * 0.63)
+    cardH = int(H - slots * step - H * 0.06)
+    cardH = max(int(H * 0.45), cardH)
+    # Straight up, not fanned. A horizontal offset turns the stack into a
+    # diagonal cascade and slides each nameplate half out of view — and the
+    # nameplate is the whole point: rank, wait, and the one sentence. Aligned,
+    # they read as a list of raised hands above the card you are answering.
+    dx = 0
 
     plan = []
     for it in items:
         k = it["rank"] - 1
-        x = X + max(0, (W - it["width"]) // 2) - k * dx
+        x = X + (W - cardW) // 2 - k * dx
         y = Y + slots * step - k * step
-        plan.append({"id": it["window"], "x": int(x), "y": int(y)})
+        plan.append({"id": it["window"], "x": int(x), "y": int(y),
+                     "w": int(cardW), "h": int(cardH)})
     return plan
 
 
