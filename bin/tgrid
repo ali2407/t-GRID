@@ -14,7 +14,7 @@
 #   tgrid --help
 set -euo pipefail
 
-VERSION="1.7"
+VERSION="1.8"
 N=4
 CMD="claude"
 DIR="$PWD"
@@ -39,16 +39,17 @@ STEP=0
 ACCENTS="0.424,0.549,1.000;0.914,0.706,0.298;0.184,0.831,0.745;1.000,0.420,0.545;0.420,0.831,0.494;0.655,0.545,0.980;1.000,0.561,0.302;0.298,0.780,0.941"
 GROUND=0.035     # how dark the ground is before the accent is mixed in
 CAST=0.042       # how much accent goes into it
-# Opaque by DEFAULT. macOS turns off subpixel antialiasing for any window that
-# is not opaque — it cannot blend subpixels against a backdrop it cannot see —
-# so translucency makes terminal text visibly soft, and it is all-or-nothing:
-# 99% opacity looks exactly as soft as 70%. Glass is lovely on a card you look
-# at; this is a wall of text you read all day. --glass if you want it anyway.
-ALPHA=1.0
-BLUR=0.0
+# Translucent by default. This was briefly turned off on the theory that
+# translucency costs subpixel antialiasing — it does not, because macOS dropped
+# subpixel antialiasing entirely in Mojave and renders everything greyscale now.
+# The soft, hand-drawn look that prompted that was a profile built from scratch
+# arriving with `font antialiasing` OFF, which is fixed separately. Glass over a
+# blurred desktop is crisp. --opaque if you want it flat anyway.
+ALPHA=0.82
+BLUR=0.7
 REPROFILE=0
-MAINPCT=58
-PEEK=96
+MAINPCT=64
+PEEK=52
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/tgrid"
 STATE="$CACHE/last-layout.json"
 
@@ -74,9 +75,9 @@ Options
       --deck         one window centred, the others peeking in from the edges
       --next         with --deck: bring the next window to the centre
       --prev         with --deck: bring the previous one
-      --main PCT     width of the centred window, % of the screen (default: 58)
-      --peek PX      how far each stacked window steps out (default: 96)
-      --glass        translucent windows with a blurred backdrop (softens text)
+      --main PCT     width of the centred window, % of the screen (default: 64)
+      --peek PX      how much less each card behind shows (default: 52)
+      --opaque       flat windows: no translucency, no blur
       --reprofile    rebuild t-GRID's Terminal profiles (after changing the look)
       --palette      print the accent colours as hex, one per line
       --plain        undo that — put the windows back on your default profile
@@ -118,7 +119,7 @@ while [[ $# -gt 0 ]]; do
     --main)       need "$1" "$#" "${2-}"; num "$1" "$2"; MAINPCT="$2"; shift 2 ;;
     --peek)       need "$1" "$#" "${2-}"; num "$1" "$2"; PEEK="$2"; shift 2 ;;
     -t|--theme)   THEME=1; shift ;;
-    --glass)      THEME=1; ALPHA=0.88; BLUR=0.55; shift ;;
+    --glass)      THEME=1; shift ;;
     --opaque)     THEME=1; ALPHA=1.0; BLUR=0.0; shift ;;
     --reprofile)  THEME=1; REPROFILE=1; shift ;;
     --plain)      THEME=2; shift ;;
@@ -252,6 +253,19 @@ theme_setup() {
   # The look is baked into the profile at import time, so changing it means
   # throwing the profiles away and building them again.
   if [[ "$REPROFILE" == "1" ]]; then
+    # Deleting a profile does not just delete the profile: every window using it
+    # is dropped back to Basic, losing its colour and getting Apple's noisy title
+    # bar back. Windows on OTHER displays are not part of this run and would
+    # simply be left broken, so note who was on what and put them back after.
+    REPROFILE_MAP="$(osascript -l JavaScript -e '
+      var T = Application("Terminal"); var out = [];
+      T.windows().forEach(function (w) {
+        try {
+          var n = w.tabs[0].currentSettings.name();
+          if (n.indexOf("t-GRID ") === 0) out.push(w.id() + ":" + n.slice(7));
+        } catch (e) {}
+      });
+      out.join(",")' 2>/dev/null || true)"
     osascript -l JavaScript -e '
       var T = Application("Terminal");
       T.settingsSets.name().forEach(function (n) {
@@ -263,6 +277,26 @@ theme_setup() {
     acc="$(cut -d';' -f"$i" <<< "$ACCENTS")"
     grep -qxF "t-GRID $i" <<< "$sets" || theme_import "t-GRID $i" "$acc"
   done
+  if [[ -n "${REPROFILE_MAP:-}" ]]; then
+    osascript -l JavaScript - "$REPROFILE_MAP" <<'JXA' >/dev/null 2>&1 || true
+function run(argv) {
+  var T = Application('Terminal');
+  argv[0].split(',').forEach(function (pair) {
+    if (!pair) return;
+    var bits = pair.split(':');
+    try {
+      var set = T.settingsSets.byName('t-GRID ' + bits[1]);
+      var tab = T.windows.byId(parseInt(bits[0], 10)).tabs[0];
+      tab.currentSettings = set;
+      tab.fontName = set.fontName();
+      tab.fontSize = set.fontSize();
+    } catch (e) {}
+  });
+  return 'ok';
+}
+JXA
+    REPROFILE_MAP=""
+  fi
 }
 
 if [[ "$THEME" == "1" ]]; then
@@ -561,38 +595,37 @@ function run(argv) {
     if (a.step) cur = ((cur + a.step) % n + n) % n;
 
     var mainW = Math.round(W * a.mainPct / 100);
-    var inset = n > 1 ? 26 : 0;          // side windows sit a little inside the
-                                         // main one, which is what reads as depth
-    var main = { x: X + Math.round((W - mainW) / 2), y: Y, width: mainW, height: H };
+    var margin = Math.floor((W - mainW) / 2);          // what shows of a parked card
+    var mainInset = n > 1 ? 16 : 0;                    // the centred card floats
+    var cardInset = n > 1 ? 44 : 0;                    // parked ones sit further back
+    var main = { x: X + margin, y: Y + mainInset, width: mainW, height: H - 2 * mainInset };
 
-    // The side windows CASCADE out from behind the centred one, and every one of
-    // them stays inside this display.
+    // A parked card shows a strip at the screen edge and is otherwise hidden.
     //
-    // The first version pushed them to the screen edges instead, so that only a
-    // strip showed — which looks right on a single monitor and is wrong on any
-    // other setup. A window is as wide as the centred one, so a strip at the edge
-    // means the other 90% of it hangs past the edge — and "past the edge" is not
-    // empty space, it is Alberto's second monitor. Every side window landed on top
-    // of the work on the other screen. On his layout ALL FOUR of them did.
+    // The obvious way to do that is to push it OFF the edge — and that is what the
+    // first version did. It is wrong on any machine with a second monitor: the
+    // hidden 80% of the window does not vanish, it lands on the next screen along.
+    // On Alberto's layout every parked card covered the other display.
     //
-    // Resizing them to fit would be the other way out, and it is worse: a narrow
-    // Terminal reflows the agent UI inside it, and these are live sessions. Only
-    // position and z-order are free. So they stack behind the centre instead, each
-    // one stepped a little further out than the one in front of it.
-    var deepest = { 1: Math.ceil((n - 1) / 2), '-1': Math.floor((n - 1) / 2) };
-    function side(dir, depth) {
-      var margin = dir > 0 ? (X + W) - (main.x + mainW) : main.x - X;
-      var levels = Math.max(1, deepest[dir] || 1);
-      // share the margin out over however many cards are on this side, so the
-      // furthest one still lands inside the screen
-      var step = Math.max(18, Math.min(a.peek, Math.floor(margin / levels)));
+    // The trick is that a card hidden behind the CENTRED one looks exactly the
+    // same as a card hanging off the screen — you cannot see either part. So park
+    // it flush with the display edge and let its body extend INWARD, behind the
+    // middle card. Same picture, nothing off-screen, and nothing gets resized:
+    // a narrow Terminal reflows the agent UI inside it, and these are live
+    // sessions. Position and z-order are free; size is not.
+    //
+    // Deeper cards step back from the edge, so each shows a little less than the
+    // one in front of it.
+    function card(dir, depth) {
+      var back = Math.min((depth - 1) * a.peek, Math.max(0, margin - 40));
       return {
-        x: main.x + dir * step * depth,
-        y: Y + inset,
+        x: dir > 0 ? (X + W - mainW - back) : (X + back),
+        y: Y + cardInset,
         width: mainW,
-        height: H - 2 * inset
+        height: H - 2 * cardInset
       };
     }
+    var side = card;
 
     // Walk out from the centre alternating right, left, right, left …
     function at(offset) { return ring[((cur + offset) % n + n) % n]; }
@@ -744,8 +777,14 @@ function run(argv) {
   if (!(n >= 1)) { return 'tgrid: nothing to do'; }
 
   // ---- grid shape: wider than tall, since terminals like columns
-  var cols = a.cols > 0 ? a.cols : Math.ceil(Math.sqrt(n));
-  var rows = a.rows > 0 ? a.rows : Math.ceil(n / cols);
+  // Fixed shapes for the counts that get used, because ceil(sqrt(n)) picks 3x3
+  // for eight windows and 4x3 for ten — both of which waste a row and leave a
+  // ragged last line. Two rows for everything up to ten, three at twelve.
+  var SHAPE = { 1: [1, 1], 2: [1, 2], 3: [1, 3], 4: [2, 2], 6: [2, 3],
+                8: [2, 4], 10: [2, 5], 12: [3, 4] };
+  var preset = (a.rows === 0 && a.cols === 0) ? SHAPE[n] : null;
+  var cols = a.cols > 0 ? a.cols : (preset ? preset[1] : Math.ceil(Math.sqrt(n)));
+  var rows = a.rows > 0 ? a.rows : (preset ? preset[0] : Math.ceil(n / cols));
   if (a.cols > 0 && a.rows === 0) rows = Math.ceil(n / cols);
   if (a.rows > 0 && a.cols === 0) cols = Math.ceil(n / rows);
   // A forced grid smaller than the window count used to push the extra windows

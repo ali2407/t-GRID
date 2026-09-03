@@ -80,6 +80,7 @@ Everything else:
 | `-d, --dir DIR` | working directory for every new window |
 | `--dirs a,b,c` | one directory per window — a window per project |
 | `-r, --rows N` | force the row count |
+| — | left alone, the grid picks the shape: 1, 1×2, 2×2, 2×3, 2×4, 2×5, 3×4 |
 | `-k, --cols N` | force the column count |
 | `-g, --gap PX` | gap between windows (default 6) |
 | `-p, --pad PX` | outer margin around the whole grid |
@@ -118,17 +119,20 @@ agents running, and you want to catch the one that stopped.
 
 **The deck** is the other half of the day: one session has your attention, the
 rest should be one keystroke away and otherwise out of the way. The focused
-window sits centred and large; the others stack behind it, each stepped a little
-further out than the one in front, so you can see how many are waiting and grab
-one by clicking its edge.
+window floats in the middle; the others are parked at the left and right screen
+edges with a strip showing, and you swipe along with `--next` / `--prev`.
 
-Everything stays on **one display**. The first version pushed the side windows to
-the screen edges so that only a strip showed, which looks right on a single
-monitor and is wrong on every other setup: a side window is as wide as the
-centred one, so a strip at the edge means the other 90% of it hangs past the
-edge — and past the edge is your second monitor. Resizing them to fit would be
-worse, because a narrow Terminal reflows the agent UI inside it and these are
-live sessions. Position and z-order are free; size is not.
+Everything stays on **one display**, and nothing is resized. The obvious way to
+park a card at the edge is to push it off the edge — which is wrong on any
+machine with a second monitor, because the hidden 80% of that window does not
+vanish, it lands on the next screen along. Resizing the cards to fit is worse: a
+narrow Terminal reflows the agent UI inside it, and these are live sessions.
+
+The way out is that a card hidden *behind the centred one* looks exactly like a
+card hanging off the screen — you cannot see either part. So a parked card sits
+flush with the display edge and extends **inward**, behind the middle card. Same
+picture, nothing off-screen, nothing resized. Cards further back step in from
+the edge so each shows a little less than the one in front.
 
 ```sh
 tgrid --deck            # centre whatever is frontmost, park the rest
