@@ -94,7 +94,7 @@ Everything else:
 | `--next` / `--prev` | move the deck one window along |
 | `--main PCT` | width of the centred window, % of the screen (default 58) |
 | `--peek PX` | how much of the nearest side window stays visible (default 150) |
-| `--opaque` | theme without the glass — solid windows, no blur |
+| `--glass` | translucent windows with a blurred backdrop (softens the text) |
 | `--reprofile` | rebuild t-GRID's profiles after changing the look |
 
 A few combinations worth knowing:
@@ -152,9 +152,13 @@ albert — ◑ 100k integration plan files — caffeinate ◂ claude — 116×43
 
 The part you actually want is in the middle. `--theme` deals with both.
 
-**Every window is dark glass.** Translucent, with the desktop behind it blurred
-out — so a window reads as a pane you can see depth through rather than a black
-rectangle. `--opaque` if you'd rather have neither.
+**Solid, and deliberately so.** t-GRID can make the windows translucent with a
+blurred backdrop — `--glass` — and it looks good in a screenshot. It is off by
+default because macOS switches off subpixel antialiasing for any window that is
+not opaque: it cannot blend subpixels against a backdrop it cannot see. Terminal
+text goes visibly soft, and it is all-or-nothing — 99% opacity looks exactly as
+soft as 70%. Glass is lovely on a card you glance at. This is a wall of text you
+read all day.
 
 **Every cell gets its own ground.** A near-black tinted with one of eight
 accents, and a cursor in that accent. Text stays the same neutral grey in every
@@ -181,8 +185,8 @@ destroys the one thing a colour is for.
 
 t-GRID does this with Terminal profiles of its own, named `t-GRID 1` … `t-GRID
 8`. Your own profiles are never touched, and `--plain` puts every window back on
-your default. The glass is baked into the profile when it is built, so after
-changing `--opaque` you need `--reprofile` to rebuild them.
+your default. The look is baked into the profile when it is built, so after
+changing `--glass` you need `--reprofile` to rebuild them.
 
 ---
 

@@ -14,7 +14,7 @@
 #   tgrid --help
 set -euo pipefail
 
-VERSION="1.4"
+VERSION="1.5"
 N=4
 CMD="claude"
 DIR="$PWD"
@@ -39,8 +39,13 @@ STEP=0
 ACCENTS="0.424,0.549,1.000;0.914,0.706,0.298;0.184,0.831,0.745;1.000,0.420,0.545;0.420,0.831,0.494;0.655,0.545,0.980;1.000,0.561,0.302;0.298,0.780,0.941"
 GROUND=0.035     # how dark the ground is before the accent is mixed in
 CAST=0.042       # how much accent goes into it
-ALPHA=0.88       # window opacity — the glass
-BLUR=0.55        # how hard the backdrop is blurred behind it
+# Opaque by DEFAULT. macOS turns off subpixel antialiasing for any window that
+# is not opaque — it cannot blend subpixels against a backdrop it cannot see —
+# so translucency makes terminal text visibly soft, and it is all-or-nothing:
+# 99% opacity looks exactly as soft as 70%. Glass is lovely on a card you look
+# at; this is a wall of text you read all day. --glass if you want it anyway.
+ALPHA=1.0
+BLUR=0.0
 REPROFILE=0
 MAINPCT=58
 PEEK=150
@@ -71,7 +76,7 @@ Options
       --prev         with --deck: bring the previous one
       --main PCT     width of the centred window, % of the screen (default: 58)
       --peek PX      how much of the nearest side window stays visible (150)
-      --opaque       theme without the glass — solid windows, no blur
+      --glass        translucent windows with a blurred backdrop (softens text)
       --reprofile    rebuild t-GRID's Terminal profiles (after changing the look)
       --palette      print the accent colours as hex, one per line
       --plain        undo that — put the windows back on your default profile
@@ -113,6 +118,7 @@ while [[ $# -gt 0 ]]; do
     --main)       need "$1" "$#" "${2-}"; num "$1" "$2"; MAINPCT="$2"; shift 2 ;;
     --peek)       need "$1" "$#" "${2-}"; num "$1" "$2"; PEEK="$2"; shift 2 ;;
     -t|--theme)   THEME=1; shift ;;
+    --glass)      THEME=1; ALPHA=0.88; BLUR=0.55; shift ;;
     --opaque)     THEME=1; ALPHA=1.0; BLUR=0.0; shift ;;
     --reprofile)  THEME=1; REPROFILE=1; shift ;;
     --plain)      THEME=2; shift ;;
@@ -469,6 +475,9 @@ function run(argv) {
       set.cursorColor     = acc;
       set.fontName = 'SFMono-Regular';
       set.fontSize = font;
+      // A profile built from scratch comes up with antialiasing OFF, which is
+      // what made the type look hand-drawn next to every other window.
+      set.fontAntialiasing = true;
       // Sizing the profile to the cell keeps the window from jumping when the
       // profile lands; place() still has the final word.
       set.numberOfColumns = Math.max(20, Math.floor((w - CHROME_W) / (COL_W * font)));
