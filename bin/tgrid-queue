@@ -1,0 +1,1190 @@
+#!/usr/bin/env python3
+"""tgrid-queue — the queue view: every session that needs an answer, in line.
+
+The grid answers "show me everything". The deck answers "one thing at a time".
+The queue answers the question that actually costs time: *which* one thing, and
+what was it asking? You come back to six terminals, and before you can type a
+word you have to re-read scrollback to remember what each one was even about.
+
+So the queue does three things:
+
+  1. works out which sessions are WAITING for you and which are still THINKING
+  2. gives each waiting session ONE sentence — where you are, what it asked
+  3. puts them in an order and stands the front one in front of you
+
+It is a separate file from `tgrid` on purpose. Everything here is reading state
+that Claude Code already writes down — transcripts and window titles — and none
+of it belongs in the window-tiling arithmetic.
+
+  tgrid-queue                 print the line-up
+  tgrid-queue arrange         ...and stack the windows in that order, front focused
+  tgrid-queue next            move the front session to the back, raise the next
+  tgrid-queue pin NAME +2     push a session up the order (or down, with -2)
+  tgrid-queue watch           background monitor: log what you answer and skip
+  tgrid-queue learn           read that log back and suggest ranking changes
+  tgrid-queue json            the machine-readable queue on stdout
+
+WHAT THE DETECTION ACTUALLY IS  (measured on this machine, 2026-09-03)
+
+  Claude Code writes a glyph into the window title, and the glyph is the state:
+  `✳` when it is sitting at the prompt, `◐ ◑ ◒ ◓` while a turn is running. Driving
+  a throwaway session through one turn and sampling the title twice a second
+  showed the transition both ways, immediately, in both directions. That is the
+  live signal, it costs one AppleScript call for all windows at once, and it
+  needs no file parsing.
+
+  `tab.busy()` is NOT that signal, and it is the obvious trap. It reports whether
+  anything other than the shell is in the foreground — so it is `true` for every
+  window running `claude`, thinking or not. Six sessions all waiting for an
+  answer reported busy=true; it went false only when claude exited.
+
+  The transcript at ~/.claude/projects/<encoded-cwd>/<session>.jsonl says the
+  rest: WHEN the turn ended, and WHAT was asked. A turn end is marked explicitly
+  by a `{"type":"system","subtype":"turn_duration"}` record — do not try to infer
+  it from "the last message is from the assistant", because assistant text blocks
+  land mid-turn, before tool calls, all the time.
+
+  Window → session is by TITLE, not by cwd: `custom-title` (what /title or an
+  agent name set) falls back to `ai-title` (the summary Claude Code writes after
+  the first turn), and that string is exactly what appears in the window title
+  after the glyph. cwd is useless here — nearly everything is launched from $HOME.
+"""
+
+import calendar
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import unicodedata
+
+HOME = os.path.expanduser("~")
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")), "tgrid")
+PROJECTS = os.path.join(HOME, ".claude", "projects")
+
+QUEUE_JSON = os.path.join(CACHE, "queue.json")
+QUEUE_MD = os.path.join(CACHE, "queue.md")
+EVENTS = os.path.join(CACHE, "events.jsonl")
+STATE = os.path.join(CACHE, "queue-state.json")
+RANKING = os.path.join(CACHE, "ranking.json")
+PINS = os.path.join(CACHE, "pins.json")
+
+# How long a transcript has to have been quiet before a session that looks
+# finished is believed to be finished. The glyph already answers this, so the
+# number only matters for a session whose window we could not find.
+QUIET_S = 3.0
+# A turn that was started and then produced nothing for this long was
+# interrupted (Esc, a crash, an API error). It is not thinking; it is stalled.
+STALLED_S = 180.0
+# Only transcripts touched this recently are candidates for a live window.
+FRESH_S = 36 * 3600
+# How long a session has to be missing from the scan entirely before it counts as
+# gone rather than merely out of scope.
+UNSEEN_S = 600.0
+
+# The two glyph families Claude Code writes into the title. The sparkles mean
+# "at the prompt", the half-circles are the spinner. Everything downstream keys
+# off which set the first character falls into, never off the exact character —
+# the spinner frame you catch depends on when you looked.
+IDLE_GLYPHS = set("✳✻✽✢*")
+BUSY_GLYPHS = set("◐◑◒◓◴◵◶◷⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+
+
+# ---------------------------------------------------------------- small io ---
+
+def _read_json(path, default=None):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _write_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def log_event(kind, **fields):
+    """Append one line to the behaviour log. This is the whole point of the
+    monitor: the log is what makes a learned ranking possible later, so it is
+    written even when nothing is looking at it, and never rewritten."""
+    os.makedirs(CACHE, exist_ok=True)
+    row = {"ts": round(time.time(), 3), "event": kind}
+    row.update(fields)
+    with open(EVENTS, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def jxa(src, timeout=25):
+    try:
+        p = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", "-e", src],
+                           capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return ""
+    return p.stdout.strip()
+
+
+# --------------------------------------------------------------- terminal ---
+
+WINDOWS_JS = """
+var T = Application('Terminal'); var out = [];
+for (var i = 0; i < T.windows.length; i++) {
+  var w = T.windows[i];
+  try {
+    if (w.miniaturized() || !w.visible()) continue;
+    var b = w.bounds(); var t = w.tabs[0];
+    out.push({ id: w.id(), name: w.name(), tty: t.tty(), index: w.index(),
+               x: b.x, y: b.y, width: b.width, height: b.height,
+               busy: (function(){ try { return t.busy(); } catch(e){ return false; } })(),
+               set: (function(){ try { return t.currentSettings.name(); } catch(e){ return ''; } })() });
+  } catch (e) {}
+}
+JSON.stringify(out)
+"""
+
+
+def terminal_windows():
+    """Every visible Terminal window, with the two things that matter: its title
+    (which carries the state glyph and the session name) and its tty."""
+    raw = jxa(WINDOWS_JS)
+    try:
+        rows = json.loads(raw) if raw else []
+    except Exception:
+        return []
+    # Terminal's window list occasionally comes back with a duplicate id — the
+    # same enumeration flakiness that made id-diffing unusable for `tgrid`.
+    # Keep the first of each.
+    seen, out = set(), []
+    for r in rows:
+        if r.get("id") in seen:
+            continue
+        seen.add(r.get("id"))
+        out.append(r)
+    return out
+
+
+def split_title(name):
+    """Terminal's raw title is one of
+
+        albert — ✳ Pong response — Python ◂ claude — 80×24     (default profile)
+        ✳ Pong response                                        (t-GRID profile)
+
+    Return (glyph, clean title). The glyph is the state; the title is the key
+    that matches a transcript's custom-title / ai-title."""
+    parts = [p.strip() for p in (name or "").split(" — ")]
+    if len(parts) > 1 and re.match(r"^\d+×\d+$", parts[-1]):
+        parts.pop()
+    # the user name is only there on the default profile, and only as part one
+    if len(parts) > 1 and parts[0] and " " not in parts[0] and not _first_glyph(parts[0]):
+        parts.pop(0)
+    head = parts[0] if parts else (name or "")
+    glyph = _first_glyph(head)
+    if glyph:
+        head = head[1:].strip()
+    return glyph, head.strip()
+
+
+def _first_glyph(s):
+    for ch in s:
+        if ch in IDLE_GLYPHS or ch in BUSY_GLYPHS:
+            return ch
+        if ch.isspace():
+            continue
+        return ""
+    return ""
+
+
+def glyph_state(glyph):
+    if glyph in BUSY_GLYPHS:
+        return "thinking"
+    if glyph in IDLE_GLYPHS:
+        return "prompt"
+    return ""          # no glyph: not a Claude Code window, or not titled yet
+
+
+def claude_pids_by_tty():
+    """tty -> pid of the `claude` process on it. Used only to tell a Claude Code
+    window apart from a plain shell when the title has no glyph yet (a session
+    that has not finished its first turn has no title of its own)."""
+    out = {}
+    try:
+        p = subprocess.run(["/bin/ps", "-axo", "pid=,tty=,command="],
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return out
+    for line in p.stdout.splitlines():
+        m = re.match(r"\s*(\d+)\s+(\S+)\s+(.*)$", line)
+        if not m:
+            continue
+        pid, tty, cmd = m.group(1), m.group(2), m.group(3)
+        base = os.path.basename(cmd.split()[0]) if cmd.split() else ""
+        if base.lstrip("-") == "claude" and tty != "??":
+            out["/dev/" + tty] = int(pid)
+    return out
+
+
+# ------------------------------------------------------------- transcripts ---
+
+def _tail(path, nbytes=400_000):
+    """Only the tail is ever needed and these files reach 20 MB. Seek back,
+    drop the partial first line."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        if size > nbytes:
+            f.seek(size - nbytes)
+            f.readline()
+        return f.read().decode("utf-8", "replace").splitlines()
+
+
+def _ts(s):
+    """2026-09-03T18:03:20.109Z -> epoch seconds.
+
+    The milliseconds are not decoration. A queued message is delivered in the
+    same second the turn it was queued behind ends — 19:20:56.851 for the
+    turn_duration, 19:20:56.861 for the message — and at second resolution the
+    two compare equal, which flips "the human has spoken since" to "the agent
+    finished last". One session was reported as waiting for three hours when it
+    had actually been interrupted."""
+    if not s:
+        return 0.0
+    try:
+        # calendar.timegm, NOT mktime minus time.timezone: `time.timezone` is the
+        # standard-time offset and ignores DST, so through the summer every wait
+        # came out exactly one hour too old. Caught by feeding the parser
+        # transcripts with known ages.
+        base = calendar.timegm(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return 0.0
+    m = re.match(r"^\.(\d{1,6})", s[19:])
+    return base + (float("0." + m.group(1)) if m else 0.0)
+
+
+def read_transcript(path):
+    """Everything the queue needs out of one session file, in a single pass over
+    its tail. Non-obvious bits:
+
+      * turn_duration is the ONLY reliable end-of-turn marker (see module docs).
+      * a `user` record whose content is nothing but tool_result is the harness
+        feeding a tool's output back, not the human typing. Counting those as
+        "the user answered" makes every working session look answered.
+      * away_summary is a recap Claude Code writes when you have been gone a
+        while. It is a better orientation line than anything we can extract,
+        and it is free — but it is only sometimes there, so it is a bonus,
+        never the mechanism.
+    """
+    rec = {
+        "path": path,
+        "session": os.path.basename(path)[:-6],
+        "title": "", "ai_title": "", "custom_title": "",
+        "cwd": "", "branch": "",
+        "turn_end": 0.0, "user_ts": 0.0, "assistant_text": "",
+        "away": "", "away_ts": 0.0,
+        "mtime": os.path.getmtime(path),
+    }
+    try:
+        lines = _tail(path)
+    except Exception:
+        return rec
+    for line in lines:
+        if not line.startswith("{"):
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        t = d.get("type")
+        if t == "ai-title":
+            rec["ai_title"] = d.get("aiTitle") or ""
+            continue
+        if t == "custom-title":
+            rec["custom_title"] = d.get("customTitle") or ""
+            continue
+        if d.get("isSidechain"):
+            continue          # a subagent's turn is not your turn
+        if d.get("cwd"):
+            rec["cwd"] = d["cwd"]
+        if d.get("gitBranch"):
+            rec["branch"] = d["gitBranch"]
+        ts = _ts(d.get("timestamp"))
+        if t == "system":
+            st = d.get("subtype")
+            if st == "turn_duration" and ts:
+                rec["turn_end"] = ts
+            elif st == "away_summary":
+                rec["away"] = (d.get("content") or "").strip()
+                rec["away_ts"] = ts
+            continue
+        if t not in ("user", "assistant"):
+            continue
+        msg = d.get("message") or {}
+        content = msg.get("content")
+        kinds = ([b.get("type") for b in content if isinstance(b, dict)]
+                 if isinstance(content, list) else ["text"])
+        if msg.get("role") == "user":
+            if kinds and all(k == "tool_result" for k in kinds):
+                continue                      # harness, not human
+            if d.get("isMeta"):
+                continue
+            if ts:
+                rec["user_ts"] = ts
+        elif msg.get("role") == "assistant":
+            if isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip():
+                        rec["assistant_text"] = b["text"]
+            elif isinstance(content, str) and content.strip():
+                rec["assistant_text"] = content
+            # an assistant record with no turn_duration after it means the turn
+            # is still open, which is exactly what turn_end/user_ts encode
+    rec["title"] = rec["custom_title"] or rec["ai_title"]
+    return rec
+
+
+def recent_transcripts(max_age=FRESH_S):
+    out = []
+    now = time.time()
+    try:
+        dirs = os.listdir(PROJECTS)
+    except OSError:
+        return out
+    for d in dirs:
+        pd = os.path.join(PROJECTS, d)
+        if not os.path.isdir(pd):
+            continue
+        for fn in os.listdir(pd):
+            if not fn.endswith(".jsonl"):
+                continue
+            p = os.path.join(pd, fn)
+            try:
+                if now - os.path.getmtime(p) <= max_age and os.path.getsize(p) > 0:
+                    out.append(p)
+            except OSError:
+                continue
+    out.sort(key=os.path.getmtime, reverse=True)
+    return out
+
+
+# ------------------------------------------------------------- the mapping ---
+
+def match(windows, records):
+    """window -> transcript, by title.
+
+    The title is the only identifier that survives Alberto's actual setup: he
+    launches nearly everything from $HOME, so cwd puts five unrelated sessions
+    in one bucket, and neither the claude process nor its environment carries
+    the session id (checked: no open handle on the .jsonl, nothing in `ps -E`).
+
+    What DOES line up exactly is the string after the glyph in the window title
+    and the transcript's custom-title, or its ai-title when no custom one was
+    set. Verified against six live sessions: six matches, no misses.
+
+    Ties are broken by recency — if two sessions ever carry the same title, the
+    one that was written to last is the one on screen. A transcript is claimed
+    at most once."""
+    by_title = {}
+    for r in records:
+        if r["title"]:
+            by_title.setdefault(_norm(r["title"]), []).append(r)
+    for k in by_title:
+        by_title[k].sort(key=lambda r: r["mtime"], reverse=True)
+
+    claimed, pairs = set(), []
+    for w in windows:
+        glyph, title = split_title(w.get("name", ""))
+        w["glyph"], w["clean"] = glyph, title
+        cands = by_title.get(_norm(title), [])
+        hit = next((r for r in cands if r["path"] not in claimed), None)
+        if hit:
+            claimed.add(hit["path"])
+        pairs.append((w, hit))
+    return pairs
+
+
+def _norm(s):
+    s = unicodedata.normalize("NFKC", s or "").strip().lower()
+    return re.sub(r"\s+", " ", s)
+
+
+# ---------------------------------------------------------------- the state --
+
+def classify(win, rec, now):
+    """waiting / thinking / stalled / idle.
+
+    The glyph in the title is the live truth and wins whenever it is there. The
+    transcript fills in the rest, and is the only source when a session has not
+    yet written a title of its own."""
+    g = glyph_state(win.get("glyph", "")) if win else ""
+    if g == "thinking":
+        return "thinking"
+    if not rec:
+        # a claude window with no transcript we can name: it exists, it is not
+        # asking us anything we can read
+        return "idle" if g != "thinking" else "thinking"
+
+    open_turn = rec["user_ts"] > rec["turn_end"]
+    quiet = now - rec["mtime"]
+
+    if g == "prompt":
+        # the window says it is at the prompt. If the last thing in the
+        # transcript is the human talking, the turn died rather than finished.
+        return "stalled" if open_turn else "waiting"
+    # no glyph to go on — fall back entirely to the file
+    if open_turn:
+        return "stalled" if quiet > STALLED_S else "thinking"
+    if rec["turn_end"] and quiet > QUIET_S:
+        return "waiting"
+    return "thinking"
+
+
+# --------------------------------------------------------- the one sentence --
+
+_AWAY_FOOTER = re.compile(r"\s*\((?:disable|deaktiviere)[^)]*\)\s*$", re.I)
+_NEXT_CUE = re.compile(r"^(next|nächste[rs]?|als n(ä|ae)chstes|offen|jetzt|fehlt|dann)\b[:,]?", re.I)
+_FENCE = re.compile(r"```.*?```", re.S)
+_LINK = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+_LEAD = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+|>\s*|#{1,6}\s*)")
+
+
+def _plain(md):
+    """Markdown out, sentence in. Backticks are unwrapped rather than dropped —
+    the thing being asked about is usually a path or a flag, and losing it turns
+    a specific question into a generic one."""
+    t = _FENCE.sub(" ", md or "")
+    t = _LINK.sub(r"\1", t)
+    t = t.replace("`", "")
+    t = re.sub(r"\*\*|__|~~", "", t)
+    lines = [_LEAD.sub("", ln).strip() for ln in t.splitlines()]
+    lines = [ln for ln in lines if ln]
+    return "\n".join(lines)
+
+
+def _sentences(text):
+    out = []
+    for para in text.split("\n"):
+        for s in re.split(r"(?<=[.!?…])\s+", para):
+            s = s.strip(" \t—–-·•")
+            if len(s) >= 3:
+                out.append(s)
+    return out
+
+
+def ask_of(rec, state, now):
+    """The sentence. Rules, in order:
+
+      1. The recap Claude Code already wrote when you walked away, if it is
+         newer than the turn. It is written for exactly this moment.
+      2. The last QUESTION in the final assistant message. A message that ends
+         "Soll ich mit der Willkommensstrecke anfangen?" has told you the whole
+         thing you need to answer.
+      3. Failing a question, the last sentence — which in practice is the
+         "say the word and I'll ..." offer, and is just as actionable.
+
+    No model call. The sentence Claude Code already wrote is better than one we
+    would pay to have written, and it is already on disk."""
+    if state == "stalled":
+        mins = int((now - max(rec["user_ts"], rec["turn_end"])) / 60)
+        return "interrupted %d min ago — the prompt is open, nothing is running" % mins
+    if rec.get("away") and rec["away_ts"] >= rec["turn_end"]:
+        # The recap signs off with "(disable recaps in /config)". Taking the
+        # last sentence blind puts a settings hint where the ask should be.
+        body = _AWAY_FOOTER.sub("", rec["away"])
+        s = _sentences(_plain(body))
+        # it is written as "Goal: … Next: …", and the second half is the ask.
+        # It comes back in whatever language the session is running in.
+        nxt = next((x for x in reversed(s)
+                    if _NEXT_CUE.match(x)), "")
+        if nxt:
+            return _clip(nxt)
+        if s:
+            return _clip(s[-1])
+    body = _plain(rec.get("assistant_text", ""))
+    sents = _sentences(body)
+    if not sents:
+        return "finished a turn with nothing to say — open it to see"
+    q = next((s for s in reversed(sents) if s.rstrip().endswith("?")), "")
+    if not q:
+        # No question mark. The next best thing is the sentence that hands the
+        # decision back — "Sag mir die Nummer", "Say the word and I'll …". These
+        # are the two languages the sessions on this machine actually run in;
+        # a session in a third one falls through to the last sentence, which is
+        # still the closing line and still specific.
+        q = next((s for s in reversed(sents) if _HANDBACK.search(s)), "")
+    return _clip(q or sents[-1])
+
+
+_HANDBACK = re.compile(
+    r"\b(sag (mir|es)|sag bescheid|soll ich|willst du|magst du|gib mir|schick mir|"
+    r"entscheide|wähl|welche[rs]? .* (willst|nimmst)|"
+    r"say the word|let me know|tell me|which one|your call|pick|confirm|"
+    r"want me to|shall i|should i)\b", re.I)
+
+
+def _clip(s, n=170):
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) <= n:
+        return s
+    cut = s[:n].rsplit(" ", 1)[0]
+    return cut + "…"
+
+
+def where_of(rec):
+    """The 'where am I' half of the sentence: project, and branch when it is not
+    the default. cwd is a bad session identifier but a fine label."""
+    cwd = rec.get("cwd") or ""
+    proj = os.path.basename(cwd.rstrip("/")) or "~"
+    if cwd == HOME:
+        proj = "~"
+    br = rec.get("branch") or ""
+    return "%s@%s" % (proj, br) if br and br not in ("main", "master") else proj
+
+
+def orientation(item):
+    """One sentence: where you are, what it is, what you are being asked."""
+    return "%s (%s): %s" % (item["title"] or "untitled", item["where"], item["ask"])
+
+
+# ------------------------------------------------------------- the ranking ---
+#
+# One pure function, one dict of weights, one struct of inputs. Nothing else in
+# this file decides order. A learned ranking replaces `score()` and touches
+# nothing above or below it — which is the only reason the behaviour log below
+# is worth writing.
+
+DEFAULT_WEIGHTS = {
+    "w_pin": 10000.0,        # an explicit pin always beats everything else
+    "w_wait_min": 1.0,       # v1 is: oldest wait first
+    "w_question": 0.0,       # a direct question over a status report — off in v1
+    "w_stalled": -500.0,     # an interrupted session goes to the back
+    "w_answer_rate": 0.0,    # from the behaviour log — reserved for the learned version
+    "w_skip_rate": 0.0,
+}
+
+
+def weights():
+    w = dict(DEFAULT_WEIGHTS)
+    w.update(_read_json(RANKING, {}) or {})
+    return w
+
+
+def features(item, history):
+    """Every input to the ranking, named, in one place. If it is not in here it
+    cannot influence the order."""
+    h = history.get(item["title"], {})
+    fronted = max(1, h.get("fronted", 0))
+    return {
+        "waited_min": item["waited_s"] / 60.0,
+        "pin": item.get("pin", 0),
+        "is_question": 1.0 if item["ask"].rstrip().endswith("?") else 0.0,
+        "is_stalled": 1.0 if item["state"] == "stalled" else 0.0,
+        "answer_rate": h.get("answered", 0) / fronted,
+        "skip_rate": h.get("skipped", 0) / fronted,
+    }
+
+
+def score(f, w):
+    """Pure. Given the features and the weights, how far up the line."""
+    return (w["w_pin"] * f["pin"]
+            + w["w_wait_min"] * f["waited_min"]
+            + w["w_question"] * f["is_question"]
+            + w["w_stalled"] * f["is_stalled"]
+            + w["w_answer_rate"] * f["answer_rate"]
+            + w["w_skip_rate"] * f["skip_rate"])
+
+
+# ------------------------------------------------------------- build the queue --
+
+def display_of(x, screens):
+    for i, s in enumerate(screens):
+        if s["x"] <= x < s["x"] + s["w"]:
+            return i
+    return 0
+
+
+def build(now=None, display=None, here=False):
+    now = now or time.time()
+    wins = terminal_windows()
+    if here:
+        # Scope the queue to one monitor. Same meaning as `tgrid --here`, and the
+        # only safe way to line up a set of windows while other live sessions are
+        # open on the other display.
+        screens = screen_frames()
+        if screens:
+            tgt = display if display is not None else display_of(
+                wins[0]["x"] if wins else 0, screens)
+            tgt = max(0, min(tgt, len(screens) - 1))
+            s = screens[tgt]
+            left, right = s["x"], s["x"] + s["w"]
+            wins = [w for w in wins
+                    if w.get("x", 0) < right and w.get("x", 0) + w.get("width", 0) > left]
+    recs = [read_transcript(p) for p in recent_transcripts()]
+    pairs = match(wins, recs)
+    pins = _read_json(PINS, {}) or {}
+    hist = history()
+    w = weights()
+
+    items, others = [], []
+    claude_ttys = claude_pids_by_tty()
+    for win, rec in pairs:
+        is_claude = bool(win.get("glyph")) or win.get("tty") in claude_ttys
+        if not is_claude:
+            continue
+        state = classify(win, rec, now)
+        if rec is None:
+            others.append({"window": win["id"], "title": win.get("clean") or "untitled",
+                           "state": state, "session": "", "where": "?", "ask": "",
+                           "user_ts": 0.0})
+            continue
+        since = rec["turn_end"] or rec["user_ts"] or rec["mtime"]
+        item = {
+            "window": win["id"],
+            "session": rec["session"],
+            "title": rec["title"] or win.get("clean") or "untitled",
+            "where": where_of(rec),
+            "cwd": rec["cwd"],
+            "branch": rec["branch"],
+            "state": state,
+            "since": since,
+            "user_ts": rec["user_ts"],
+            "waited_s": max(0.0, now - since) if state in ("waiting", "stalled") else 0.0,
+            "pin": int(pins.get(rec["title"], 0)),
+            "transcript": rec["path"],
+            "x": win.get("x", 0), "y": win.get("y", 0),
+            "width": win.get("width", 0), "height": win.get("height", 0),
+        }
+        item["ask"] = ask_of(rec, state, now)
+        item["line"] = orientation(item)
+        if state in ("waiting", "stalled"):
+            items.append(item)
+        else:
+            others.append(item)
+
+    for it in items:
+        it["features"] = features(it, hist)
+        it["score"] = score(it["features"], w)
+    items.sort(key=lambda i: (-i["score"], i["since"]))
+    for n, it in enumerate(items, 1):
+        it["rank"] = n
+
+    return {"generated": round(now, 3), "weights": w, "queue": items, "other": others}
+
+
+# ------------------------------------------------------- the behaviour log ---
+#
+# Every event goes to ~/.cache/tgrid/events.jsonl as one JSON object per line.
+# The log is deliberately dumber than it could be: raw events with timestamps,
+# no aggregation, nothing overwritten. Aggregates can always be recomputed from
+# a raw log; a raw log cannot be recovered from aggregates.
+
+def observe(q, fronted_window=None):
+    """Diff this scan against the last one and write down what changed. Called by
+    every command that looks at the queue, so the log fills up during normal use
+    rather than only while a monitor happens to be running.
+
+    Three things this has to get right, each of which got it wrong first:
+
+      * ANSWERED is "a message from you landed after the turn we were waiting
+        on" — not "the session is thinking now". Keying it off the current state
+        misses every fast turn: you answer, the agent finishes in ten seconds,
+        and by the next scan it is waiting again on a new question, so the wait
+        you actually ended never gets recorded as ended.
+      * OUT OF SCOPE is not GONE. `--here` narrows the scan to one monitor, and
+        treating the other monitor's sessions as departed made them "leave" and
+        "enter" again on every alternating scan.
+      * The state file is written LAST, so a scan that throws writes nothing and
+        the next one simply re-derives everything. That is also why every event
+        is keyed by the turn it belongs to rather than by a counter.
+    """
+    now = q["generated"]
+    prev = _read_json(STATE, {}) or {}
+    seen = {k: dict(v) for k, v in (prev.get("sessions") or {}).items()}
+    nxt = {}
+
+    live = {it["session"]: it for it in q["queue"]}
+    everything = {it["session"]: it for it in q["queue"] + q["other"] if it.get("session")}
+
+    # 1. answers. A session we can still see whose last human message is newer
+    #    than the turn we were waiting on has been answered — whatever it is
+    #    doing now. Recorded once per turn, so a slow scan cannot double count.
+    for sid, old in seen.items():
+        it = everything.get(sid)
+        since = old.get("since")
+        if not it or since is None or old.get("answered_for") == since:
+            continue
+        answered_at = it.get("user_ts") or 0.0
+        if answered_at <= since + 0.5:
+            continue
+        log_event("answered", session=sid, title=old.get("title") or it.get("title", ""),
+                  waited_s=round(answered_at - since, 1),
+                  fronted=bool(old.get("fronted_at")),
+                  answer_latency_s=(round(answered_at - old["fronted_at"], 1)
+                                    if old.get("fronted_at") else None))
+        old["answered_for"] = since
+        old["fronted_at"] = None
+
+    # 2. new waits.
+    for sid, it in live.items():
+        old = seen.get(sid, {})
+        rec = dict(old)
+        rec.pop("unseen_since", None)
+        if old.get("since") != it["since"]:
+            log_event("entered", session=sid, window=it["window"], title=it["title"],
+                      where=it["where"], state=it["state"], ask=it["ask"])
+            rec = {"since": it["since"], "entered_at": now, "fronted_at": None,
+                   "fronted_count": 0}
+        rec["title"] = it["title"]
+        rec["rank"] = it["rank"]
+        nxt[sid] = rec
+
+    # 3. departures. Only for sessions this scan actually looked at; one that was
+    #    out of scope keeps its record until it has been missing long enough to
+    #    be a closed window.
+    for sid, old in seen.items():
+        if sid in live:
+            continue
+        it = everything.get(sid)
+        if it is None:
+            gone_since = old.get("unseen_since") or now
+            if now - gone_since < UNSEEN_S:
+                old["unseen_since"] = gone_since
+                nxt[sid] = old
+                continue
+            log_event("left", session=sid, title=old.get("title", ""),
+                      waited_s=round(now - old.get("entered_at", now), 1),
+                      reason="window gone")
+            continue
+        if old.get("answered_for") != old.get("since"):
+            # stopped waiting without a message from you: interrupted, /clear,
+            # a resume into a different session file
+            log_event("left", session=sid, title=old.get("title", ""),
+                      waited_s=round(now - old.get("entered_at", now), 1),
+                      reason=it["state"])
+
+    # 4. who is in front of you now, and who you walked past to get there.
+    #    One pass over the sessions actually IN this scan: walking the carried
+    #    forward records instead means reading a window id off a session that was
+    #    never in `live`.
+    if fronted_window is not None:
+        for sid, it in live.items():
+            r = nxt.setdefault(sid, {"since": it["since"], "entered_at": now})
+            if it["window"] == fronted_window:
+                r["fronted_at"] = now
+                r["fronted_count"] = r.get("fronted_count", 0) + 1
+                log_event("front", session=sid, window=it["window"], title=it["title"],
+                          rank=it["rank"], waited_s=round(it["waited_s"], 1), ask=it["ask"])
+            elif seen.get(sid, {}).get("fronted_at"):
+                # it had your attention, it is still waiting, and you moved on
+                log_event("skipped", session=sid, title=it["title"],
+                          waited_s=round(it["waited_s"], 1))
+                r["fronted_at"] = None
+
+    _write_json(STATE, {"at": now, "sessions": nxt})
+
+
+def history():
+    """Per-session-title counts pulled back out of the log — the input a learned
+    ranking would want. Keyed by title because session ids churn (a resume or a
+    /compact starts a new file) while the name he gave the work does not."""
+    h = {}
+    try:
+        with open(EVENTS, encoding="utf-8") as f:
+            rows = [json.loads(ln) for ln in f if ln.strip().startswith("{")]
+    except Exception:
+        return h
+    for r in rows:
+        t = r.get("title") or ""
+        if not t:
+            continue
+        d = h.setdefault(t, {"fronted": 0, "answered": 0, "skipped": 0,
+                             "waits": [], "latencies": []})
+        e = r.get("event")
+        if e == "front":
+            d["fronted"] += 1
+        elif e == "answered":
+            d["answered"] += 1
+            if r.get("waited_s") is not None:
+                d["waits"].append(r["waited_s"])
+            if r.get("answer_latency_s") is not None:
+                d["latencies"].append(r["answer_latency_s"])
+        elif e == "skipped":
+            d["skipped"] += 1
+    return h
+
+
+# ---------------------------------------------------------------- rendering --
+
+def fmt_wait(s):
+    s = int(s)
+    if s < 90:
+        return "%ds" % s
+    if s < 5400:
+        return "%dm" % (s // 60)
+    return "%dh%02dm" % (s // 3600, (s % 3600) // 60)
+
+
+def render_text(q, colour=True):
+    def dim(s):
+        return "\033[2m%s\033[0m" % s if colour else s
+
+    def bold(s):
+        return "\033[1m%s\033[0m" % s if colour else s
+
+    out = []
+    if not q["queue"]:
+        thinking = [o for o in q["other"] if o["state"] == "thinking"]
+        out.append("nobody is waiting for you." +
+                   (" %d session(s) still thinking." % len(thinking) if thinking else ""))
+        return "\n".join(out)
+    out.append("%d waiting for you" % len(q["queue"]))
+    for it in q["queue"]:
+        head = "%d. %-26s %6s  %s" % (it["rank"], it["title"][:26],
+                                      fmt_wait(it["waited_s"]), it["where"])
+        if it["pin"]:
+            head += "  pin%+d" % it["pin"]
+        out.append(bold(head) if it["rank"] == 1 else head)
+        out.append("   " + dim(it["ask"]))
+    busy = [o for o in q["other"] if o["state"] == "thinking"]
+    if busy:
+        out.append(dim("   thinking: " + ", ".join(o["title"][:20] for o in busy)))
+    return "\n".join(out)
+
+
+def render_md(q):
+    """The rendered snippet — the thing to paste, or point a brain at. Kept
+    plain on purpose: it has to read the same in a terminal, in Obsidian and in
+    a Claude session that was handed the file."""
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(q["generated"]))
+    lines = ["## Waiting for you — %s" % when, ""]
+    if not q["queue"]:
+        lines.append("- nothing waiting.")
+    for it in q["queue"]:
+        lines.append("- **%s** (%s, waiting %s) — %s"
+                     % (it["title"], it["where"], fmt_wait(it["waited_s"]), it["ask"]))
+    busy = [o for o in q["other"] if o["state"] == "thinking"]
+    if busy:
+        lines += ["", "_Still thinking: %s._" % ", ".join(o["title"] for o in busy)]
+    return "\n".join(lines) + "\n"
+
+
+def publish(q):
+    _write_json(QUEUE_JSON, q)
+    os.makedirs(CACHE, exist_ok=True)
+    with open(QUEUE_MD, "w", encoding="utf-8") as f:
+        f.write(render_md(q))
+
+
+# ------------------------------------------------------------- the staging ---
+
+ARRANGE_JS = r"""
+function run(argv) {
+  ObjC.import('AppKit'); ObjC.import('Foundation');
+  var plan = JSON.parse(argv[0]);
+  var T = Application('Terminal');
+  function delay(s) { $.NSThread.sleepForTimeInterval(s); }
+
+  // Position only. NEVER width/height: resizing a Terminal window running a TUI
+  // makes Claude Code reflow its whole transcript, and these are live sessions.
+  // Every move re-sends the size the window already reports.
+  function move(id, x, y) {
+    var w;
+    try { w = T.windows.byId(id); } catch (e) { return; }
+    for (var pass = 0; pass < 3; pass++) {
+      var got;
+      try { got = w.bounds(); } catch (e) { return; }
+      // Terminal reads bounds relative to the primary screen's top and writes
+      // them relative to the whole desktop's top. The offset depends on the
+      // monitor arrangement, so converge on it instead of hardcoding it.
+      try { w.bounds = { x: x, y: y, width: got.width, height: got.height }; } catch (e) { return; }
+      var now;
+      try { now = w.bounds(); } catch (e) { return; }
+      var dx = x - now.x, dy = y - now.y;
+      if (Math.abs(dx) <= 2 && Math.abs(dy) <= 2) return;
+      x += dx; y += dy;
+    }
+  }
+
+  T.activate();
+  // Back of the line first, so each window ends up on top of the one behind it
+  // and the front of the queue ends up on top of everything.
+  for (var i = plan.length - 1; i >= 0; i--) {
+    if (plan[i].x !== null) move(plan[i].id, plan[i].x, plan[i].y);
+    try { T.windows.byId(plan[i].id).frontmost = true; } catch (e) {}
+  }
+  if (plan.length) {
+    try {
+      var f = T.windows.byId(plan[0].id);
+      f.index = 1; f.frontmost = true;
+    } catch (e) {}
+  }
+  return 'ok';
+}
+"""
+
+
+def screen_frames():
+    src = ("ObjC.import('AppKit');" +
+           "JSON.stringify($.NSScreen.screens.js.map(function(s){"
+           "var f=s.frame,v=s.visibleFrame;"
+           "return {x:f.origin.x,y:f.origin.y,w:f.size.width,h:f.size.height,"
+           "vx:v.origin.x,vy:v.origin.y,vw:v.size.width,vh:v.size.height};}))")
+    try:
+        return json.loads(jxa(src) or "[]")
+    except Exception:
+        return []
+
+
+def stage(q, display=None):
+    """Where each window goes. The rule that shapes all of this: position and
+    z-order are free, size is not.
+
+    The front session sits at the stage anchor. Everyone behind it is shifted up
+    and left by one title bar each, so their title bars — and the nameplates
+    t-GRID parks on them — stack above the front window like a list of raised
+    hands. If the windows are too tall for that to fit, the offset collapses to
+    zero and the order survives only in z and in the queue panel. Nothing is
+    ever resized to make it fit."""
+    items = q["queue"]
+    if not items:
+        return []
+    screens = screen_frames()
+    if not screens:
+        return [{"id": it["window"], "x": None, "y": None} for it in items]
+    # AppleScript's y origin is the top of the primary screen
+    prim = screens[0]
+    if display is None:
+        # the display the front window is already on — the queue rearranges
+        # around you, it does not move you to another monitor
+        display = display_of(items[0]["x"], screens)
+    display = max(0, min(display, len(screens) - 1))
+    s = screens[display]
+    top = prim["h"] - (s["vy"] + s["vh"])
+    X, Y, W, H = int(s["vx"]), int(round(top)), int(s["vw"]), int(s["vh"])
+
+    tall = max((it["height"] for it in items), default=0)
+    slots = len(items) - 1
+    headroom = max(0, H - tall)
+    step = 0 if slots == 0 else min(34, headroom // slots)
+    if step and step < 26:
+        step = 0                      # less than a title bar shows nothing useful
+    dx = 14 if step else 0
+
+    plan = []
+    for it in items:
+        k = it["rank"] - 1
+        x = X + max(0, (W - it["width"]) // 2) - k * dx
+        y = Y + slots * step - k * step
+        plan.append({"id": it["window"], "x": int(x), "y": int(y)})
+    return plan
+
+
+def arrange(q, display=None):
+    plan = stage(q, display)
+    if not plan:
+        return "tgrid: nobody is waiting for you"
+    jxa("(%s)(%s)" % (ARRANGE_JS, json.dumps([json.dumps(plan)])), timeout=40)
+    return None
+
+
+# ---------------------------------------------------------------- the learner --
+
+def learn():
+    """Read the log back and say, in words, what the ordering is getting wrong.
+
+    It suggests; it never edits ranking.json itself. An ordering that quietly
+    rewrites itself is one you stop trusting the moment it surprises you."""
+    h = history()
+    try:
+        with open(EVENTS, encoding="utf-8") as f:
+            rows = [json.loads(ln) for ln in f if ln.strip().startswith("{")]
+    except Exception:
+        rows = []
+    if not rows:
+        return ("no behaviour log yet — %s is empty.\n"
+                "Run `tgrid-queue watch` (or just use `tgrid --queue`) for a few days first."
+                % EVENTS)
+
+    out = ["%d events since %s" % (len(rows),
+                                   time.strftime("%d %b", time.localtime(rows[0]["ts"])))]
+    fronted = sum(1 for r in rows if r["event"] == "front")
+    answered = sum(1 for r in rows if r["event"] == "answered")
+    skipped = sum(1 for r in rows if r["event"] == "skipped")
+    out.append("%d brought to the front · %d answered · %d walked past" % (fronted, answered, skipped))
+
+    # 1. sessions you keep skipping — the order is putting them too high
+    for title, d in sorted(h.items(), key=lambda kv: -kv[1]["skipped"]):
+        if d["fronted"] >= 3 and d["skipped"] >= 0.6 * d["fronted"]:
+            out.append("· You walk past \"%s\" %d of the %d times it reaches the front. "
+                       "Pin it down: tgrid-queue pin \"%s\" -1" % (title, d["skipped"], d["fronted"], title))
+    # 2. sessions you answer instantly — they deserve to be higher
+    for title, d in h.items():
+        lat = d["latencies"]
+        if len(lat) >= 3 and sorted(lat)[len(lat) // 2] < 45 and d["skipped"] == 0:
+            out.append("· \"%s\" gets answered in under a minute every time (median %ds). "
+                       "Pin it up: tgrid-queue pin \"%s\" +1"
+                       % (title, int(sorted(lat)[len(lat) // 2]), title))
+    # 3. does asking a real question predict an answer? that is w_question
+    qa = [r for r in rows if r["event"] == "front" and r.get("ask")]
+    if len(qa) >= 10:
+        asked = [r for r in qa if r["ask"].rstrip().endswith("?")]
+        rate = lambda g: (sum(1 for r in g if _answered_after(rows, r)) / len(g)) if g else 0.0
+        ra, rb = rate(asked), rate([r for r in qa if r not in asked])
+        if asked and ra - rb > 0.2:
+            out.append("· Sessions that ended on a direct question get answered %d%% of the time, "
+                       "reports only %d%%. Try w_question: 30 in %s" %
+                       (round(ra * 100), round(rb * 100), RANKING))
+    # 4. is waiting longest actually what you pick? that is w_wait_min
+    ranks = [r.get("rank") for r in rows if r["event"] == "front" and r.get("rank")]
+    if len(ranks) >= 10:
+        top = sum(1 for r in ranks if r == 1) / len(ranks)
+        out.append("· You take the session the order put first %d%% of the time." % round(top * 100))
+        if top < 0.5:
+            out.append("  Under half — the order is not matching you. The two knobs are "
+                       "w_wait_min (lower = age matters less) and w_question in %s" % RANKING)
+    if len(out) <= 2:
+        out.append("· Nothing to suggest yet — the order and your choices agree so far.")
+    return "\n".join(out)
+
+
+def _answered_after(rows, front_row):
+    sid = front_row.get("session")
+    for r in rows:
+        if r["ts"] > front_row["ts"] and r.get("session") == sid:
+            if r["event"] == "answered":
+                return True
+            if r["event"] in ("front", "skipped"):
+                return False
+    return False
+
+
+# ------------------------------------------------------------------- cli ----
+
+def cmd_show(args):
+    q = build(display=args.display, here=args.here)
+    publish(q)
+    observe(q)
+    print(render_text(q, colour=sys.stdout.isatty()))
+    return 0
+
+
+def cmd_json(args):
+    q = build(display=args.display, here=args.here)
+    publish(q)
+    observe(q)
+    json.dump(q, sys.stdout, indent=1, ensure_ascii=False)
+    print()
+    return 0
+
+
+def cmd_md(args):
+    q = build(display=args.display, here=args.here)
+    publish(q)
+    sys.stdout.write(render_md(q))
+    return 0
+
+
+def cmd_arrange(args, step=0):
+    q = build(display=args.display, here=args.here)
+    if step and len(q["queue"]) > 1:
+        # walking the line is a rotation, not a re-sort: the one you passed over
+        # goes to the back and keeps its place there until it is answered
+        n = len(q["queue"])
+        q["queue"] = q["queue"][step % n:] + q["queue"][:step % n]
+        for i, it in enumerate(q["queue"], 1):
+            it["rank"] = i
+    publish(q)
+    front = q["queue"][0]["window"] if q["queue"] else None
+    observe(q, fronted_window=front)
+    msg = arrange(q, args.display)
+    if msg:
+        print(msg)
+        return 1
+    print(render_text(q, colour=sys.stdout.isatty()))
+    return 0
+
+
+def cmd_pin(args):
+    pins = _read_json(PINS, {}) or {}
+    if args.value == 0:
+        pins.pop(args.name, None)
+    else:
+        pins[args.name] = args.value
+    _write_json(PINS, pins)
+    print("pins: " + (", ".join("%s %+d" % (k, v) for k, v in sorted(pins.items())) or "none"))
+    return 0
+
+
+def cmd_watch(args):
+    """The background monitor. It does not move a single window — it only looks,
+    and writes down what it sees, so it is safe to leave running all day."""
+    print("watching every %ds — logging to %s (ctrl-c to stop)" % (args.interval, EVENTS))
+    while True:
+        try:
+            q = build(display=args.display, here=args.here)
+            publish(q)
+            observe(q)
+        except Exception as e:                       # never let one bad scan end the watch
+            log_event("error", detail=str(e)[:200])
+        time.sleep(max(5, args.interval))
+
+
+def cmd_learn(args):
+    print(learn())
+    return 0
+
+
+def main(argv):
+    import argparse
+    p = argparse.ArgumentParser(prog="tgrid-queue", add_help=True,
+                                description=__doc__.split("\n\n")[0])
+    p.add_argument("-D", "--display", type=int, default=None,
+                   help="display index to stage the queue on (default: where the front window already is)")
+    p.add_argument("--here", action="store_true",
+                   help="only sessions whose window is on that display")
+    sub = p.add_subparsers(dest="cmd")
+    sub.add_parser("show", help="print the line-up (default)")
+    sub.add_parser("json", help="the machine-readable queue on stdout")
+    sub.add_parser("md", help="the rendered markdown snippet on stdout")
+    sub.add_parser("arrange", help="stack the windows in queue order, front focused")
+    sub.add_parser("next", help="move the front session to the back and raise the next")
+    sub.add_parser("prev", help="the other way round")
+    pin = sub.add_parser("pin", help="pin a session up (+n) or down (-n); 0 clears")
+    pin.add_argument("name")
+    pin.add_argument("value", type=int)
+    w = sub.add_parser("watch", help="background monitor: log what you answer and skip")
+    w.add_argument("--interval", type=int, default=20)
+    sub.add_parser("learn", help="read the log back and suggest ranking changes")
+
+    args = p.parse_args(argv)
+    os.makedirs(CACHE, exist_ok=True)
+    cmd = args.cmd or "show"
+    if cmd == "show":
+        return cmd_show(args)
+    if cmd == "json":
+        return cmd_json(args)
+    if cmd == "md":
+        return cmd_md(args)
+    if cmd == "arrange":
+        return cmd_arrange(args, 0)
+    if cmd == "next":
+        return cmd_arrange(args, 1)
+    if cmd == "prev":
+        return cmd_arrange(args, -1)
+    if cmd == "pin":
+        return cmd_pin(args)
+    if cmd == "watch":
+        return cmd_watch(args)
+    if cmd == "learn":
+        return cmd_learn(args)
+    p.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)
