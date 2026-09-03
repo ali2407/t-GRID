@@ -14,7 +14,7 @@
 #   tgrid --help
 set -euo pipefail
 
-VERSION="1.5"
+VERSION="1.6"
 N=4
 CMD="claude"
 DIR="$PWD"
@@ -478,10 +478,6 @@ function run(argv) {
       // A profile built from scratch comes up with antialiasing OFF, which is
       // what made the type look hand-drawn next to every other window.
       set.fontAntialiasing = true;
-      // Sizing the profile to the cell keeps the window from jumping when the
-      // profile lands; place() still has the final word.
-      set.numberOfColumns = Math.max(20, Math.floor((w - CHROME_W) / (COL_W * font)));
-      set.numberOfRows    = Math.max(10, Math.floor((h - CHROME_H) / (ROW_H * font)));
       // the half of the title bar AppleScript can reach — the plist did the rest
       set.titleDisplaysDeviceName   = false;
       set.titleDisplaysShellPath    = false;
@@ -504,7 +500,16 @@ function run(argv) {
       if (a.theme === 1) { set = themeFor(i, font, w, h); }
       else { try { set = Term.defaultSettings; } catch (e) {} }
       if (!set) continue;
-      try { Term.windows.byId(ids[i]).tabs[0].currentSettings = set; } catch (e) {}
+      try {
+        var tab = Term.windows.byId(ids[i]).tabs[0];
+        tab.currentSettings = set;
+        // And then say it again to the WINDOW. A settings set is shared state:
+        // a window that has been through an earlier run at a different cell size
+        // does not reliably pick the profile's font back up, so windows drifted
+        // apart — some left at 11pt, some at 15pt, while every profile and every
+        // tab still reported 12. Setting it on the tab is what actually lands.
+        if (a.theme === 1) { tab.fontName = 'SFMono-Regular'; tab.fontSize = font; }
+      } catch (e) {}
     }
     delay(0.3);
   }
